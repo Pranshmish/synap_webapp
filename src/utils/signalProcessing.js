@@ -30,8 +30,8 @@ export const DETECTION_CONFIG = {
 
     // === NOISE FLOOR TRACKING (Rolling MAD) ===
     NOISE_WINDOW_SAMPLES: 100,   // 500ms at 200Hz
-    ADAPTIVE_THRESHOLD_MULT: 3.2, // Signal must be 3.2x MAD to trigger
-    MIN_NOISE_FLOOR: 0.02,       // Minimum noise floor (normalized)
+    ADAPTIVE_THRESHOLD_MULT: 2.0, // Signal must be 2.0x MAD to trigger (lowered for sensitivity)
+    MIN_NOISE_FLOOR: 0.015,      // Minimum noise floor (normalized, lowered)
 
     // === ENERGY-TRIGGERED DETECTION ===
     ENERGY_WINDOW_MS: 22,        // ~4 samples at 200Hz
@@ -46,11 +46,11 @@ export const DETECTION_CONFIG = {
     REFRACTORY_SAMPLES: 48,      // 240ms at 200Hz
 
     // === VERIFICATION FILTERS ===
-    MIN_DURATION_MS: 28,         // Minimum footstep length
-    MAX_DURATION_MS: 310,        // Maximum footstep length
-    MIN_DURATION_SAMPLES: 6,     // ~28ms at 200Hz
-    MAX_DURATION_SAMPLES: 62,    // ~310ms at 200Hz
-    MIN_RMS_RAW: 0.04,           // Minimum RMS (normalized)
+    MIN_DURATION_MS: 20,         // Minimum footstep length (lowered)
+    MAX_DURATION_MS: 400,        // Maximum footstep length (increased)
+    MIN_DURATION_SAMPLES: 4,     // ~20ms at 200Hz
+    MAX_DURATION_SAMPLES: 80,    // ~400ms at 200Hz
+    MIN_RMS_RAW: 0.01,           // Minimum RMS (normalized, lowered for sensitivity)
 
     // === SPECTRAL VALIDATION ===
     SPECTRAL_PEAK_LOW_HZ: 20,
@@ -64,11 +64,15 @@ export const DETECTION_CONFIG = {
     LIF_ALPHA: 0.22,             // Exponential smoothing factor
 
     // === DISPLAY ===
-    GAIN: 25.0,
+    GAIN: 50.0,                  // Increased for better visualization
     WARMUP_SAMPLES: 100,         // 500ms warmup
 
     // === BACKEND FORMAT ===
     TARGET_SAMPLES: 200,         // Resample to 400ms at 200Hz
+
+    // === RAW AMPLITUDE GATE (ADC units) ===
+    // Treat |raw-baseline| below this as noise (no trigger). 0 = disabled.
+    RAW_DELTA_GATE_ADC: 0
 };
 
 // Sensitivity presets
@@ -76,34 +80,34 @@ export const SENSITIVITY_PRESETS = {
     low: {
         name: '🔇 Low',
         description: 'Only very strong footsteps',
-        ADAPTIVE_THRESHOLD_MULT: 4.5,
-        MIN_RMS_RAW: 0.08,
-        MIN_DURATION_MS: 40,
-        GAIN: 15.0
+        ADAPTIVE_THRESHOLD_MULT: 3.5,
+        MIN_RMS_RAW: 0.05,
+        MIN_DURATION_MS: 30,
+        GAIN: 35.0
     },
     medium: {
         name: '🔉 Medium',
         description: 'Balanced (recommended)',
-        ADAPTIVE_THRESHOLD_MULT: 3.2,
-        MIN_RMS_RAW: 0.04,
-        MIN_DURATION_MS: 28,
-        GAIN: 25.0
+        ADAPTIVE_THRESHOLD_MULT: 2.0,
+        MIN_RMS_RAW: 0.02,
+        MIN_DURATION_MS: 20,
+        GAIN: 50.0
     },
     high: {
         name: '🔊 High',
         description: 'Sensitive - quieter footsteps',
-        ADAPTIVE_THRESHOLD_MULT: 2.5,
-        MIN_RMS_RAW: 0.025,
-        MIN_DURATION_MS: 20,
-        GAIN: 35.0
+        ADAPTIVE_THRESHOLD_MULT: 1.5,
+        MIN_RMS_RAW: 0.012,
+        MIN_DURATION_MS: 15,
+        GAIN: 65.0
     },
     ultra: {
         name: '📡 Ultra',
         description: 'Maximum - may catch some noise',
-        ADAPTIVE_THRESHOLD_MULT: 2.0,
-        MIN_RMS_RAW: 0.015,
-        MIN_DURATION_MS: 15,
-        GAIN: 45.0
+        ADAPTIVE_THRESHOLD_MULT: 1.0,
+        MIN_RMS_RAW: 0.008,
+        MIN_DURATION_MS: 10,
+        GAIN: 80.0
     }
 };
 
@@ -383,8 +387,8 @@ const isContinuousNoise = (eventBuffer, noiseFloor) => {
     // Real footsteps have sharp attack and decay
     const coeffOfVariation = eventStd / Math.max(Math.abs(mean(eventBuffer)), 0.001);
 
-    // If coefficient of variation is low, it's continuous noise
-    return coeffOfVariation < 0.3 && eventRms < noiseFloor * 2;
+    // Very lenient check - only reject obvious continuous hum
+    return coeffOfVariation < 0.15 && eventRms < noiseFloor * 1.5;
 };
 
 /**
@@ -441,6 +445,13 @@ export const validateFootstepEvent = (eventBuffer, baselineMean, noiseFloor, con
     // Center the signal
     const centered = eventBuffer.map(v => v - baselineMean);
 
+    // 0. Enforce raw amplitude gate at event level
+    const peakAbs = Math.max(...centered.map(Math.abs));
+    if (peakAbs < (config.RAW_DELTA_GATE_ADC || 0)) {
+        reasons.push(`Below raw amplitude gate: peak ${peakAbs.toFixed(0)} < ${config.RAW_DELTA_GATE_ADC}`);
+        return { valid: false, reasons, isNoise: true };
+    }
+
     // 1. Duration check
     const durationSamples = eventBuffer.length;
     if (durationSamples < config.MIN_DURATION_SAMPLES) {
@@ -490,14 +501,14 @@ export const validateFootstepEvent = (eventBuffer, baselineMean, noiseFloor, con
     const totalEnergy = bandEnergy(frequencies, magnitudes, 0, 200);
     const bandRatio = footstepBandEnergy / Math.max(totalEnergy, 0.001);
 
-    if (bandRatio < 0.3) {
+    if (bandRatio < 0.1) {
         reasons.push(`Spectral energy outside footstep band: ${(bandRatio * 100).toFixed(0)}%`);
         return { valid: false, reasons, isNoise: true };
     }
 
     // 7. Peak height check
     const peakDev = Math.max(...centered.map(Math.abs));
-    if (peakDev < noiseFloor * config.ADAPTIVE_THRESHOLD_MULT * 0.5) {
+    if (peakDev < noiseFloor * config.ADAPTIVE_THRESHOLD_MULT * 0.2) {
         reasons.push(`Peak too low relative to noise: ${peakDev.toFixed(3)} vs threshold ${(noiseFloor * config.ADAPTIVE_THRESHOLD_MULT).toFixed(3)}`);
         return { valid: false, reasons, isNoise: true };
     }
@@ -696,6 +707,11 @@ export class FootstepEventDetector {
         const normalized = this.normalize(filtered);
         const amplified = filtered * this.config.GAIN;
 
+        // Raw amplitude gate (ADC domain) - suppress triggering but keep signal/energy
+        const rawDelta = Math.abs(raw - this.baselineMean);
+        const gateEnabled = (this.config.RAW_DELTA_GATE_ADC || 0) > 0;
+        const belowRawGate = gateEnabled && (rawDelta < this.config.RAW_DELTA_GATE_ADC);
+
         let detectedEvent = null;
 
         // Refractory period check
@@ -725,6 +741,34 @@ export class FootstepEventDetector {
             };
         }
 
+        // If under raw amplitude gate and not in an active event, treat as quiet noise
+        if (!this.eventActive && belowRawGate) {
+            // Maintain pre-buffer
+            this.preBuffer.push(raw);
+            if (this.preBuffer.length > this.config.PRE_BUFFER_SAMPLES) {
+                this.preBuffer.shift();
+            }
+
+            // Update quiet-time stats
+            this.updateBaseline(raw);
+            this.updateNoiseFloor(filtered);
+            this.updateRms(filtered);
+
+            return {
+                event: null,
+                raw,
+                filtered: 0,
+                normalized: 0,
+                energy: 0,
+                noiseFloor: this.noiseFloor,
+                threshold: this.adaptiveThreshold,
+                isWarmup: false,
+                eventActive: false,
+                inRefractory: false,
+                gated: true
+            };
+        }
+
         if (!this.eventActive) {
             // Maintain pre-buffer
             this.preBuffer.push(raw);
@@ -733,7 +777,7 @@ export class FootstepEventDetector {
             }
 
             // Check for energy trigger
-            const triggered = energy > this.adaptiveThreshold;
+            const triggered = !belowRawGate && (energy > this.adaptiveThreshold);
 
             if (triggered) {
                 // Start event capture

@@ -155,7 +155,8 @@ function Vibrations() {
 
   // ============== SENSITIVITY/THRESHOLD ==============
   const [sensitivity, setSensitivity] = useState('medium');
-  const [customThreshold, setCustomThreshold] = useState(3.2); // Default: adaptive threshold multiplier
+  const [customThreshold, setCustomThreshold] = useState(2.0); // Default: adaptive threshold multiplier
+  const [rawGate, setRawGate] = useState(DETECTION_CONFIG.RAW_DELTA_GATE_ADC || 0);
 
   // ============== ML THRESHOLD OVERRIDE ==============
   const [mlThresholdOverride, setMlThresholdOverride] = useState(null); // null = use model default
@@ -208,8 +209,34 @@ function Vibrations() {
         // Update adaptive threshold multiplier
         detectorRef.current.updateConfig({
           ADAPTIVE_THRESHOLD_MULT: threshold,
-          MIN_RMS_RAW: Math.max(0.01, 0.1 / threshold)
+          // Decrease MIN_RMS slightly with lower thresholds, within safe bounds
+          MIN_RMS_RAW: Math.max(0.005, Math.min(0.06, 0.02 * threshold))
         });
+      }
+    }
+  };
+
+  // Lower threshold quick action (reduce by 80%)
+  const lowerThresholdEightyPercent = () => {
+    const newVal = Math.max(0.1, customThreshold * 0.2);
+    setCustomThreshold(newVal);
+    setSensitivity('custom');
+    if (detectorRef.current) {
+      detectorRef.current.updateConfig({
+        ADAPTIVE_THRESHOLD_MULT: newVal,
+        MIN_RMS_RAW: Math.max(0.005, Math.min(0.06, 0.02 * newVal))
+      });
+    }
+    showToast(`⬇️ Threshold reduced by 80% → ${newVal.toFixed(2)}x`, 'success');
+  };
+
+  // Raw amplitude gate handler
+  const handleRawGateChange = (value) => {
+    const gate = parseInt(value, 10);
+    if (!isNaN(gate) && gate >= 0 && gate <= 2048) {
+      setRawGate(gate);
+      if (detectorRef.current) {
+        detectorRef.current.updateConfig({ RAW_DELTA_GATE_ADC: gate });
       }
     }
   };
@@ -1343,7 +1370,7 @@ function Vibrations() {
               </div>
               <input
                 type="range"
-                min="1.2"
+                min="0.2"
                 max="6.0"
                 step="0.1"
                 value={customThreshold}
@@ -1351,11 +1378,43 @@ function Vibrations() {
                 className="w-full h-3 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
               />
               <div className="flex justify-between text-xs text-gray-500 mt-1">
-                <span>🔊 Sensitive (1.2x)</span>
+                <span>🔊 Ultra Sensitive (0.2x)</span>
                 <span>🔇 Strict (6x)</span>
               </div>
               <p className="text-xs text-green-400 mt-2">
                 💡 Spike must be this many times larger than recent activity. Higher = rejects more noise.
+              </p>
+              <div className="mt-3 flex gap-2">
+                <button
+                  onClick={lowerThresholdEightyPercent}
+                  className="px-3 py-1.5 rounded-lg bg-cyan-700 hover:bg-cyan-600 text-sm"
+                >
+                  ⬇️ Reduce by 80%
+                </button>
+              </div>
+            </div>
+
+            {/* Raw Amplitude Gate (ADC) */}
+            <div className="mb-4 p-3 bg-gray-800 rounded-lg">
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-sm text-gray-400">🧱 Raw Amplitude Gate (ADC):</label>
+                <span className="text-emerald-400 font-bold">{rawGate} ADC</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="2000"
+                step="10"
+                value={rawGate}
+                onChange={(e) => handleRawGateChange(e.target.value)}
+                className="w-full h-3 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+              />
+              <div className="flex justify-between text-xs text-gray-500 mt-1">
+                <span>Off/Low</span>
+                <span>Strict</span>
+              </div>
+              <p className="text-xs text-emerald-400 mt-2">
+                💡 Below this |raw-baseline| is treated as noise (zeroed, no trigger). Lower to allow quieter steps.
               </p>
             </div>
 
