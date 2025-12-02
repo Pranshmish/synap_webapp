@@ -122,6 +122,27 @@ export const isConfidentMatch = (result, threshold = 0.5) => {
     return result && result.confidence >= threshold;
 };
 
+/**
+ * Check if prediction result indicates an intruder
+ * @param {Object} result - Prediction result from backend
+ * @returns {boolean} - True if intruder detected
+ */
+export const isIntruderDetected = (result) => {
+    return result && result.is_intruder === true;
+};
+
+/**
+ * Get alert level based on prediction result
+ * @param {Object} result - Prediction result
+ * @returns {'safe'|'warning'|'danger'} - Alert level
+ */
+export const getAlertLevel = (result) => {
+    if (!result) return 'warning';
+    if (result.is_intruder) return 'danger';
+    if (result.confidence < 0.5) return 'warning';
+    return 'safe';
+};
+
 export default {
     isValidADCValue,
     isValidChunk,
@@ -131,4 +152,6 @@ export default {
     formatPrediction,
     formatMetrics,
     isConfidentMatch,
+    isIntruderDetected,
+    getAlertLevel,
 };
