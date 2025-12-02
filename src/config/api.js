@@ -16,10 +16,18 @@ export const ENDPOINTS = {
     FEATURES: '/model/features',
 };
 
-// Binary classification labels
+// One-class anomaly detection labels
+// Only HOME is needed for training - INTRUDER is detected as anomaly
 export const LABELS = {
     HOME: 'HOME',
-    INTRUDER: 'INTRUDER'
+    INTRUDER: 'INTRUDER'  // Detected as anomaly, not trained
+};
+
+// Model type - One-Class Anomaly Detection
+export const MODEL_CONFIG = {
+    type: 'One-Class Anomaly Detection',
+    trainingLabel: 'HOME',  // Only HOME samples used for training
+    description: 'Trains on HOME footsteps only. Intruders detected as anomalies.'
 };
 
 // Serial/Buffer Configuration
@@ -34,9 +42,9 @@ export const BUFFER_CONFIG = {
 // API Helper Functions
 export const api = {
     /**
-     * Save training data chunk to backend
+     * Save training data chunk to backend (HOME samples only for training)
      * @param {number[]} rawTimeSeries - Array of 200 ADC values
-     * @param {string} label - Person name (Pranshul, Aditi, Apurv, Samir)
+     * @param {string} label - Label (HOME for training)
      * @returns {Promise<{success: boolean, samples_per_person: Object}>}
      */
     async saveTrainData(rawTimeSeries, label) {

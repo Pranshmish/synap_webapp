@@ -3,26 +3,58 @@
  * Matches the Python reference implementation with smart validation
  */
 
-// Detection Constants (slightly liberal for weaker footsteps)
+// Detection Constants - EXTREMELY sensitive, almost no filtering
 export const DETECTION_CONFIG = {
-    THRESHOLD_MULT: 2.0,      // Baseline multiplier for threshold
-    MIN_SAMPLES: 40,          // Minimum event length
-    MAX_SAMPLES: 500,         // Maximum event length
-    IDLE_TIMEOUT: 50,         // Samples of idle before event ends
-    MIN_PEAK_DEVIATION: 35.0, // Minimum peak deviation from baseline
-    MIN_SIGNAL_STD: 6.0,      // Minimum signal standard deviation
-    MIN_ENERGY: 2200.0,       // Minimum signal energy
-    MIN_SNR: 1.5,             // Minimum signal-to-noise ratio
-    MIN_PEAK_RATIO: 1.3,      // Minimum peak-to-mean ratio
-    MIN_DOMINANT_FREQ: 10.0,  // Hz - minimum dominant frequency
-    MAX_DOMINANT_FREQ: 80.0,  // Hz - maximum dominant frequency
-    BP_LOW: 8,                // Bandpass low cutoff Hz
-    BP_HIGH: 90,              // Bandpass high cutoff Hz
-    FILTER_ORDER: 4,          // Butterworth filter order
-    GAIN: 8.0,                // Signal amplification gain
-    BASELINE_BUFFER_SIZE: 400,// Rolling baseline buffer
-    WARMUP_THRESHOLD: 100,    // Samples before active detection
+    THRESHOLD_MULT: 0.15,     // 80% lower - extremely sensitive
+    MIN_SAMPLES: 5,           // Very short events allowed
+    MAX_SAMPLES: 1000,        // Allow longer events
+    IDLE_TIMEOUT: 15,         // Quick event end detection
+    MIN_PEAK_DEVIATION: 1.0,  // Almost any peak detected
+    MIN_SIGNAL_STD: 0.5,      // Extremely low std threshold
+    MIN_ENERGY: 10.0,         // Almost no energy requirement
+    MIN_SNR: 0.05,            // Almost no SNR requirement
+    MIN_PEAK_RATIO: 1.01,     // Almost any peak ratio
+    MIN_DOMINANT_FREQ: 1.0,   // Hz - very low minimum frequency
+    MAX_DOMINANT_FREQ: 150.0, // Hz - high maximum frequency
+    BP_LOW: 1,                // Very wide bandpass
+    BP_HIGH: 150,             // Very wide bandpass
+    FILTER_ORDER: 2,          // Lighter filtering
+    GAIN: 20.0,               // Maximum signal amplification
+    BASELINE_BUFFER_SIZE: 100,// Smaller baseline buffer for faster response
+    WARMUP_THRESHOLD: 20,     // Very fast warmup
     SAMPLE_RATE: 200,         // Hz
+};
+
+// Sensitivity presets - much wider range for testing
+export const SENSITIVITY_PRESETS = {
+    low: {
+        name: 'Low (Strict)',
+        THRESHOLD_MULT: 0.5,
+        MIN_PEAK_DEVIATION: 10.0,
+        MIN_SNR: 0.3,
+        MIN_ENERGY: 200.0
+    },
+    medium: {
+        name: 'Medium (Balanced)',
+        THRESHOLD_MULT: 0.2,
+        MIN_PEAK_DEVIATION: 3.0,
+        MIN_SNR: 0.1,
+        MIN_ENERGY: 30.0
+    },
+    high: {
+        name: 'High (Ultra Sensitive)',
+        THRESHOLD_MULT: 0.05,
+        MIN_PEAK_DEVIATION: 0.5,
+        MIN_SNR: 0.01,
+        MIN_ENERGY: 5.0
+    },
+    extreme: {
+        name: 'Extreme (No Filter)',
+        THRESHOLD_MULT: 0.01,
+        MIN_PEAK_DEVIATION: 0.1,
+        MIN_SNR: 0.001,
+        MIN_ENERGY: 1.0
+    }
 };
 
 /**
@@ -351,10 +383,18 @@ export class FootstepEventDetector {
     }
 
     /**
-     * Calculate dynamic threshold
+     * Calculate dynamic threshold - extremely low floor for testing
      */
     getThreshold() {
-        return Math.max(25.0, this.baselineStd * this.config.THRESHOLD_MULT);
+        // Floor of 0.5 instead of 5.0 for maximum sensitivity
+        return Math.max(0.5, this.baselineStd * this.config.THRESHOLD_MULT);
+    }
+
+    /**
+     * Update config with new values (for sensitivity adjustment)
+     */
+    updateConfig(newConfig) {
+        this.config = { ...this.config, ...newConfig };
     }
 
     /**

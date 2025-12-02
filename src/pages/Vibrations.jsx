@@ -33,6 +33,7 @@ import {
   EyeOff,
   Download,
   Upload,
+  Sliders,
 } from "lucide-react";
 
 // Import API and utilities
@@ -47,6 +48,7 @@ import {
   FootstepEventDetector,
   LIFNeuron,
   DETECTION_CONFIG,
+  SENSITIVITY_PRESETS,
   mean,
   std,
 } from "../utils/signalProcessing";
@@ -62,11 +64,14 @@ ChartJS.register(
   Filler
 );
 
-// Binary classification labels
-const SAMPLE_MODES = [
-  { value: "HOME", label: "🏠 HOME Sample", color: "from-green-500 to-emerald-500" },
-  { value: "INTRUDER", label: "🚨 INTRUDER Sample", color: "from-red-500 to-orange-500" }
-];
+// One-Class Anomaly Detection - Only HOME samples needed for training
+// Intruders are automatically detected as anomalies (outliers from HOME patterns)
+const TRAINING_MODE = {
+  value: "HOME",
+  label: "🏠 HOME Training",
+  color: "from-green-500 to-emerald-500",
+  description: "Train on HOME samples only. Intruders detected as anomalies."
+};
 
 // Chart options for better performance
 const chartOptions = {
@@ -103,7 +108,9 @@ const fftChartOptions = {
 
 function Vibrations() {
   // ============== CORE STATE ==============
-  const [sampleMode, setSampleMode] = useState("HOME"); // "HOME" or "INTRUDER"
+  // One-Class Anomaly Detection: Always train on HOME, detect intruders as anomalies
+  const sampleMode = "HOME"; // Fixed to HOME for one-class anomaly detection
+  const [labelName, setLabelName] = useState(""); // Custom label name for saving
   const [status, setStatus] = useState("Idle — Connect serial to begin");
   const [prediction, setPrediction] = useState(null);
   const [isConnected, setIsConnected] = useState(false);
@@ -146,6 +153,10 @@ function Vibrations() {
   const [autoSaveEnabled, setAutoSaveEnabled] = useState(false);
   const [livePredictEnabled, setLivePredictEnabled] = useState(false);
 
+  // ============== SENSITIVITY/THRESHOLD ==============
+  const [sensitivity, setSensitivity] = useState('medium');
+  const [customThreshold, setCustomThreshold] = useState(0.15);
+
   // ============== TOASTS ==============
   const [toasts, setToasts] = useState([]);
 
@@ -164,6 +175,35 @@ function Vibrations() {
     detectorRef.current = new FootstepEventDetector(DETECTION_CONFIG);
     lifNeuronRef.current = new LIFNeuron(0.020, 0.025, 0.010, 200);
   }, []);
+
+  // ============== SENSITIVITY CHANGE HANDLER ==============
+  const handleSensitivityChange = (newSensitivity) => {
+    setSensitivity(newSensitivity);
+    if (newSensitivity === 'custom') {
+      // Keep custom threshold
+      if (detectorRef.current) {
+        detectorRef.current.updateConfig({ THRESHOLD_MULT: customThreshold });
+      }
+    } else {
+      const preset = SENSITIVITY_PRESETS[newSensitivity];
+      if (preset && detectorRef.current) {
+        detectorRef.current.updateConfig(preset);
+        setCustomThreshold(preset.THRESHOLD_MULT);
+      }
+    }
+    showToast(`🎚️ Sensitivity set to ${newSensitivity}`, 'success');
+  };
+
+  const handleCustomThresholdChange = (value) => {
+    const threshold = parseFloat(value);
+    if (!isNaN(threshold) && threshold > 0) {
+      setCustomThreshold(threshold);
+      setSensitivity('custom');
+      if (detectorRef.current) {
+        detectorRef.current.updateConfig({ THRESHOLD_MULT: threshold });
+      }
+    }
+  };
 
   // ============== TOAST SYSTEM ==============
   const showToast = useCallback((message, type = 'success') => {
@@ -234,7 +274,9 @@ function Vibrations() {
       setSpikeMarkers([]);
       setValidatedEvents([]);
       setDetectionStats({ totalSamples: 0, eventsDetected: 0, eventsRejected: 0, lastRejectionReason: null });
-      setStatus(`🟢 Connected — Recording ${sampleMode} samples...`);
+
+      const effectiveLabel = labelName.trim() || sampleMode;
+      setStatus(`🟢 Connected — Recording as "${effectiveLabel}"...`);
 
       readLoop(reader);
     } catch (err) {
@@ -396,6 +438,9 @@ function Vibrations() {
   };
 
   // ============== SAVE EVENT TO BACKEND ==============
+  // Get the effective label (custom name or mode)
+  const getEffectiveLabel = () => labelName.trim() || sampleMode;
+
   const saveEventToBackend = async (event) => {
     // Throttle: max 2 saves per second
     const now = Date.now();
@@ -405,11 +450,14 @@ function Vibrations() {
     const backendData = FootstepEventDetector.toBackendFormat(event);
     if (!backendData) return;
 
+    const effectiveLabel = getEffectiveLabel();
+
     try {
-      const result = await api.saveTrainData(backendData, sampleMode);
+      const result = await api.saveTrainData(backendData, effectiveLabel);
       if (result.samples_per_person) {
         setSampleCounts(result.samples_per_person);
       }
+      showToast(`💾 Auto-saved to ${effectiveLabel}`, 'success');
     } catch (error) {
       console.error("Auto-save failed:", error);
     }
@@ -445,15 +493,16 @@ function Vibrations() {
       return showToast("⚠ No validated events to save.", "warning");
     }
 
+    const effectiveLabel = getEffectiveLabel();
     setIsSaving(true);
-    setStatus(`⬆ Uploading ${sampleMode} samples...`);
+    setStatus(`⬆ Uploading samples as "${effectiveLabel}"...`);
 
     try {
       let savedCount = 0;
       for (const event of validatedEvents) {
         const backendData = FootstepEventDetector.toBackendFormat(event);
         if (backendData) {
-          await api.saveTrainData(backendData, sampleMode);
+          await api.saveTrainData(backendData, effectiveLabel);
           savedCount++;
         }
       }
@@ -461,8 +510,8 @@ function Vibrations() {
       await fetchStatus();
       setValidatedEvents([]);
 
-      showToast(`✅ Saved ${savedCount} ${sampleMode} samples!`, 'success');
-      setStatus(`✅ Saved ${savedCount} ${sampleMode} samples`);
+      showToast(`✅ Saved ${savedCount} samples as "${effectiveLabel}"!`, 'success');
+      setStatus(`✅ Saved ${savedCount} samples as "${effectiveLabel}"`);
     } catch (error) {
       showToast(`❌ Save failed: ${error.message}`, 'error');
       setStatus(`❌ Save failed: ${error.message}`);
@@ -474,7 +523,7 @@ function Vibrations() {
   // ============== TRAIN MODEL ==============
   const handleTrainModel = async () => {
     setIsTraining(true);
-    setStatus("🤖 Training binary classifier (HOME vs INTRUDER)...");
+    setStatus("🧠 Training anomaly detector on HOME patterns...");
 
     try {
       const result = await api.trainModel(sampleMode);
@@ -483,11 +532,11 @@ function Vibrations() {
       if (result.metrics) {
         setTrainingMetrics(result.metrics);
         const accuracy = (result.metrics.accuracy * 100).toFixed(1);
-        showToast(`🎯 Model trained! Accuracy: ${accuracy}%`, 'success');
-        setStatus(`🎯 Binary classifier ready! Accuracy: ${accuracy}%`);
+        showToast(`🎯 Anomaly detector trained! Accuracy: ${accuracy}%`, 'success');
+        setStatus(`🎯 Anomaly detector ready! Accuracy: ${accuracy}%`);
       } else {
-        showToast('🎯 Model trained successfully!', 'success');
-        setStatus("🎯 Binary classifier trained!");
+        showToast('🎯 Anomaly detector trained successfully!', 'success');
+        setStatus("🎯 Anomaly detector trained on HOME patterns!");
       }
 
       await fetchStatus();
@@ -728,7 +777,7 @@ function Vibrations() {
       {/* HEADER */}
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl md:text-3xl font-bold flex gap-2 items-center">
-          <Activity className="text-cyan-400" /> SynapSense Binary Classifier
+          <Activity className="text-cyan-400" /> SynapSense Anomaly Detector
         </h1>
         <div className="flex items-center gap-2">
           <span className={`px-3 py-1 rounded-full text-sm ${isConnected ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
@@ -737,34 +786,45 @@ function Vibrations() {
         </div>
       </div>
 
-      {/* SAMPLE MODE SELECTOR */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+      {/* ONE-CLASS ANOMALY DETECTION INFO */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+        <div className="bg-gradient-to-r from-green-600/20 to-emerald-600/20 p-4 rounded-xl border border-green-500/30">
+          <label className="block text-sm text-green-400 mb-2 font-semibold">🧠 One-Class Anomaly Detection</label>
+          <div className="flex items-center gap-2 mb-2">
+            <CheckCircle className="w-5 text-green-400" />
+            <span className="text-lg font-bold text-green-300">Training Mode: HOME</span>
+          </div>
+          <p className="text-xs text-gray-400">
+            Train on HOME footsteps only. Model learns "normal" patterns and automatically detects unknown intruders as anomalies.
+          </p>
+        </div>
+
         <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700">
-          <label className="block text-sm text-gray-400 mb-2">Sample Mode (HOME vs INTRUDER):</label>
+          <label className="block text-sm text-gray-400 mb-2">Person Name (Optional):</label>
           <div className="flex gap-2">
-            {SAMPLE_MODES.map(mode => (
-              <button
-                key={mode.value}
-                onClick={() => setSampleMode(mode.value)}
-                className={`flex-1 py-3 px-4 rounded-xl font-bold transition-all ${sampleMode === mode.value
-                  ? `bg-gradient-to-r ${mode.color} shadow-lg`
-                  : 'bg-gray-700 hover:bg-gray-600'
-                  }`}
-              >
-                {mode.label}
-              </button>
-            ))}
+            <input
+              type="text"
+              value={labelName}
+              onChange={(e) => setLabelName(e.target.value)}
+              placeholder="e.g., Pranshul, Aditi, Samir..."
+              className="flex-1 text-white bg-gray-700 p-3 rounded-lg border border-gray-600 focus:border-cyan-500 focus:outline-none"
+              onKeyPress={(e) => e.key === 'Enter' && showToast(`✅ Label set to: ${labelName || 'HOME'}`, 'success')}
+            />
+            <button
+              onClick={() => showToast(`✅ Label set to: ${labelName || 'HOME'}`, 'success')}
+              className="px-4 py-2 bg-cyan-600 hover:bg-cyan-700 rounded-lg font-bold transition-all"
+            >
+              Set
+            </button>
           </div>
           <p className="text-xs text-gray-500 mt-2">
-            {sampleMode === 'HOME'
-              ? '🏠 Recording footsteps from known home users'
-              : '🚨 Recording footsteps from unknown/intruder sources'}
+            Saving as: <strong className="text-cyan-400 text-base">{labelName || 'HOME'}</strong>
           </p>
         </div>
 
         <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700">
           <label className="block text-sm text-gray-400 mb-2">Auto Modes:</label>
-          <div className="flex gap-4">
+          <div className="flex flex-col gap-2">
             <label className="flex items-center gap-2 cursor-pointer">
               <input
                 type="checkbox"
@@ -788,12 +848,12 @@ function Vibrations() {
         </div>
       </div>
 
-      {/* SAMPLE COUNTS GRID - BINARY */}
+      {/* SAMPLE COUNTS - ONE-CLASS ANOMALY DETECTION */}
       <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700 mb-6">
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2">
             <Users className="w-5 text-cyan-400" />
-            <span className="font-semibold">Training Data (Binary Classification)</span>
+            <span className="font-semibold">Training Data (One-Class Anomaly Detection)</span>
           </div>
           <div className="flex items-center gap-2">
             <span className={`px-2 py-1 rounded text-xs ${modelTrained ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
@@ -805,45 +865,35 @@ function Vibrations() {
           </div>
         </div>
         <div className="grid grid-cols-2 gap-4">
-          {/* HOME Counter */}
-          <div
-            className={`p-4 rounded-xl transition ${sampleMode === 'HOME'
-              ? 'bg-gradient-to-r from-green-600 to-emerald-600 shadow-lg shadow-green-500/20'
-              : 'bg-gray-700/50'
-              }`}
-          >
+          {/* HOME Counter - Main training data */}
+          <div className="p-4 rounded-xl bg-gradient-to-r from-green-600 to-emerald-600 shadow-lg shadow-green-500/20">
             <div className="flex items-center gap-2 mb-1">
-              <CheckCircle className={`w-5 ${sampleMode === 'HOME' ? 'text-white' : 'text-green-400'}`} />
-              <span className="text-sm text-gray-300">HOME</span>
+              <CheckCircle className="w-5 text-white" />
+              <span className="text-sm text-gray-200">HOME (Training Data)</span>
             </div>
             <div className="text-3xl font-bold">{sampleCounts.HOME || 0}</div>
-            <div className="text-xs text-gray-400">samples</div>
+            <div className="text-xs text-gray-200">samples</div>
           </div>
 
-          {/* INTRUDER Counter */}
-          <div
-            className={`p-4 rounded-xl transition ${sampleMode === 'INTRUDER'
-              ? 'bg-gradient-to-r from-red-600 to-orange-600 shadow-lg shadow-red-500/20'
-              : 'bg-gray-700/50'
-              }`}
-          >
+          {/* Anomaly Detection Info */}
+          <div className="p-4 rounded-xl bg-gray-700/50 border border-dashed border-gray-500">
             <div className="flex items-center gap-2 mb-1">
-              <AlertTriangle className={`w-5 ${sampleMode === 'INTRUDER' ? 'text-white' : 'text-red-400'}`} />
-              <span className="text-sm text-gray-300">INTRUDER</span>
+              <AlertTriangle className="w-5 text-yellow-400" />
+              <span className="text-sm text-gray-300">INTRUDER Detection</span>
             </div>
-            <div className="text-3xl font-bold">{sampleCounts.INTRUDER || 0}</div>
-            <div className="text-xs text-gray-400">samples</div>
+            <div className="text-lg font-semibold text-yellow-400">Auto-Detected</div>
+            <div className="text-xs text-gray-400">via anomaly scoring</div>
           </div>
         </div>
 
         {/* Progress indicator */}
         <div className="mt-3 pt-3 border-t border-gray-700">
           <div className="flex items-center justify-between text-sm">
-            <span className="text-gray-400">Total samples: {(sampleCounts.HOME || 0) + (sampleCounts.INTRUDER || 0)}</span>
-            <span className={`${((sampleCounts.HOME || 0) >= 10 && (sampleCounts.INTRUDER || 0) >= 10) ? 'text-green-400' : 'text-yellow-400'}`}>
-              {((sampleCounts.HOME || 0) >= 10 && (sampleCounts.INTRUDER || 0) >= 10)
-                ? '✅ Ready to train!'
-                : `⚠ Need ≥10 of each class`}
+            <span className="text-gray-400">HOME samples: {sampleCounts.HOME || 0}</span>
+            <span className={`${(sampleCounts.HOME || 0) >= 10 ? 'text-green-400' : 'text-yellow-400'}`}>
+              {(sampleCounts.HOME || 0) >= 10
+                ? '✅ Ready to train anomaly detector!'
+                : `⚠ Need ≥10 HOME samples`}
             </span>
           </div>
         </div>
@@ -1121,6 +1171,57 @@ function Vibrations() {
             <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
               <Settings className="w-5" /> Detection Parameters
             </h3>
+
+            {/* Sensitivity Presets */}
+            <div className="mb-4">
+              <label className="block text-sm text-gray-400 mb-2">Sensitivity Preset:</label>
+              <div className="flex gap-2 flex-wrap">
+                {Object.entries(SENSITIVITY_PRESETS).map(([key, preset]) => (
+                  <button
+                    key={key}
+                    onClick={() => handleSensitivityChange(key)}
+                    className={`px-4 py-2 rounded-lg font-medium transition-all ${sensitivity === key
+                      ? 'bg-cyan-600 text-white shadow-lg'
+                      : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                      }`}
+                  >
+                    {preset.name}
+                  </button>
+                ))}
+                <button
+                  onClick={() => setSensitivity('custom')}
+                  className={`px-4 py-2 rounded-lg font-medium transition-all ${sensitivity === 'custom'
+                    ? 'bg-purple-600 text-white shadow-lg'
+                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                    }`}
+                >
+                  🔧 Custom
+                </button>
+              </div>
+            </div>
+
+            {/* Custom Threshold Slider - Extended Range */}
+            <div className="mb-4 p-3 bg-gray-800 rounded-lg">
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-sm text-gray-400">Threshold Multiplier:</label>
+                <span className="text-cyan-400 font-bold">{customThreshold.toFixed(3)}x</span>
+              </div>
+              <input
+                type="range"
+                min="0.01"
+                max="1.0"
+                step="0.01"
+                value={customThreshold}
+                onChange={(e) => handleCustomThresholdChange(e.target.value)}
+                className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+              />
+              <div className="flex justify-between text-xs text-gray-500 mt-1">
+                <span>🔥 Extreme (0.01)</span>
+                <span>Normal (1.0)</span>
+              </div>
+            </div>
+
+            {/* Current Detection Parameters */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
               <div className="bg-gray-800 p-3 rounded-lg">
                 <div className="text-gray-400">Min Samples</div>
@@ -1135,8 +1236,8 @@ function Vibrations() {
                 <div className="font-bold">{DETECTION_CONFIG.MIN_DOMINANT_FREQ}-{DETECTION_CONFIG.MAX_DOMINANT_FREQ} Hz</div>
               </div>
               <div className="bg-gray-800 p-3 rounded-lg">
-                <div className="text-gray-400">Gain</div>
-                <div className="font-bold">{DETECTION_CONFIG.GAIN}x</div>
+                <div className="text-gray-400">Threshold</div>
+                <div className="font-bold text-cyan-400">{customThreshold.toFixed(1)}x</div>
               </div>
             </div>
           </div>
