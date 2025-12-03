@@ -34,6 +34,9 @@ import {
   Download,
   Upload,
   Sliders,
+  Brain,
+  User,
+  X,
 } from "lucide-react";
 
 // Import API and utilities
@@ -108,19 +111,21 @@ const fftChartOptions = {
 
 function Vibrations() {
   // ============== CORE STATE ==============
-  // HOME/INTRUDER Classification with dual dataset saving
-  const [saveLabel, setSaveLabel] = useState("HOME"); // HOME or INTRUDER
-  const [labelName, setLabelName] = useState(""); // Custom sub-label name (e.g., Apurv)
+  // All data is saved as HOME - INTRUDER is detected by MLP, not stored
+  const [labelName, setLabelName] = useState(""); // Person name (e.g., Apurv, Samir)
   const [status, setStatus] = useState("Idle — Connect serial to begin");
   const [prediction, setPrediction] = useState(null);
   const [isConnected, setIsConnected] = useState(false);
   const [sampleCounts, setSampleCounts] = useState({});
   const [trainingMetrics, setTrainingMetrics] = useState(null);
+  const [trainingDetails, setTrainingDetails] = useState(null); // Detailed training results
+  const [showTrainingDetails, setShowTrainingDetails] = useState(false); // Toggle details panel
+  const [selectedDatasets, setSelectedDatasets] = useState([]); // Selected datasets for training
+  const [availableDatasets, setAvailableDatasets] = useState([]); // Available datasets from backend
 
   // ============== DUAL DATASET STATUS ==============
   const [dualDatasetStatus, setDualDatasetStatus] = useState({
     home_csv: { samples: 0, persons: [] },
-    intruder_csv: { samples: 0 },
     progress_percent: 0,
     target_samples: 150
   });
@@ -146,6 +151,7 @@ function Vibrations() {
   const [fftData, setFftData] = useState({ frequencies: [], magnitudes: [] });
   const [lifData, setLifData] = useState([]);
   const [spikeMarkers, setSpikeMarkers] = useState([]);
+  const [captureHighlight, setCaptureHighlight] = useState(null); // {startIdx, endIdx, timestamp} for highlighting captured region
 
   // ============== EVENT DETECTION STATE ==============
   const [validatedEvents, setValidatedEvents] = useState([]);
@@ -286,6 +292,16 @@ function Vibrations() {
         console.log('[fetchStatus] Dataset status:', datasetStatus);
         if (datasetStatus.dual_dataset) {
           setDualDatasetStatus(datasetStatus.dual_dataset);
+
+          // Update available datasets from persons list
+          const persons = datasetStatus.dual_dataset.home_csv?.persons || [];
+          if (persons.length > 0) {
+            setAvailableDatasets(persons);
+            // Auto-select all datasets if none selected
+            if (selectedDatasets.length === 0) {
+              setSelectedDatasets(persons);
+            }
+          }
         }
         if (datasetStatus.mlp_model) {
           console.log('[fetchStatus] MLP status:', datasetStatus.mlp_model);
@@ -413,9 +429,9 @@ function Vibrations() {
       totalSamples: prev.totalSamples + 1
     }));
 
-    // Store raw samples for manual capture (last 1 second = 200 samples)
+    // Store raw samples for manual capture (last 0.5 second = 100 samples)
     manualBufferRef.current.push(rawValue);
-    if (manualBufferRef.current.length > 200) {
+    if (manualBufferRef.current.length > 100) {
       manualBufferRef.current.shift();
     }
 
@@ -540,7 +556,7 @@ function Vibrations() {
 
   // ============== MANUAL CAPTURE ==============
   const handleManualCapture = () => {
-    if (manualBufferRef.current.length < 50) {
+    if (manualBufferRef.current.length < 25) {
       showToast('⚠ Not enough data - wait a moment', 'warning');
       return;
     }
@@ -548,6 +564,27 @@ function Vibrations() {
     // Create a simple event from the manual buffer
     const capturedSamples = [...manualBufferRef.current];
     const detector = detectorRef.current;
+    const captureTime = Date.now();
+
+    // Calculate the indices for highlighting on the chart
+    // The capture window is the last 100 samples (0.5 second at 200Hz)
+    const currentDataLength = amplifiedData.length;
+    const capturedLength = capturedSamples.length;
+    const startIdx = Math.max(0, currentDataLength - capturedLength);
+    const endIdx = currentDataLength;
+
+    // Set capture highlight for visualization
+    setCaptureHighlight({
+      startIdx,
+      endIdx,
+      timestamp: captureTime,
+      samples: capturedLength
+    });
+
+    // Clear highlight after 3 seconds
+    setTimeout(() => {
+      setCaptureHighlight(null);
+    }, 3000);
 
     const manualEvent = {
       raw: capturedSamples,
@@ -560,7 +597,7 @@ function Vibrations() {
       },
       baselineMean: detector?.baselineMean || 2048,
       noiseFloor: detector?.noiseFloor || 0.02,
-      timestamp: Date.now(),
+      timestamp: captureTime,
       isNoise: false,
       manualCapture: true
     };
@@ -568,8 +605,8 @@ function Vibrations() {
     // Add to validated events
     setValidatedEvents(prev => {
       const updated = [...prev, manualEvent];
-      console.log(`📸 Manual capture! Total collected: ${updated.length}`);
-      showToast(`📸 Captured ${capturedSamples.length} samples manually!`, 'success');
+      console.log(`📸 Manual capture! Total collected: ${updated.length}, Samples: ${capturedLength}`);
+      showToast(`📸 Captured ${capturedSamples.length} samples (${(capturedLength / 200 * 1000).toFixed(0)}ms)!`, 'success');
       return updated;
     });
 
@@ -645,9 +682,10 @@ function Vibrations() {
   const getEffectiveLabel = () => {
     const customName = labelName.trim();
     if (customName) {
-      return `${saveLabel}_${customName}`;
+      // Always use HOME prefix - INTRUDER is detected by MLP, not stored
+      return `HOME_${customName}`;
     }
-    return saveLabel;
+    return 'HOME';
   };
 
   // ============== PREDICT EVENT WITH MLP (Live Prediction) ==============
@@ -723,14 +761,27 @@ function Vibrations() {
 
   // ============== TRAIN MLP MODEL ==============
   const handleTrainMLP = async () => {
+    if (selectedDatasets.length === 0) {
+      showToast('⚠️ Please select at least one dataset to train on', 'warning');
+      return;
+    }
+
     setIsTraining(true);
-    setStatus("🧠 Training Simple MLP (150 samples → 92% accuracy)...");
+    setStatus(`🧠 Training MLP on ${selectedDatasets.length} dataset(s)...`);
+    setTrainingDetails(null);
+    setShowTrainingDetails(false);
 
     try {
-      const result = await api.trainMLP();
+      // Pass selected datasets to backend
+      const result = await api.trainMLP(selectedDatasets);
 
       if (result.success) {
         const accuracy = result.metrics?.training_accuracy ?? 0;
+        const cvAccuracy = result.metrics?.cv_accuracy ?? null;
+        const cvStd = result.metrics?.cv_std ?? null;
+        const cvScores = result.metrics?.cv_scores ?? [];
+        const nFolds = result.metrics?.n_folds ?? 5;
+
         setTrainingMetrics(result.metrics);
         setMlpModelStatus({ trained: true, accuracy });
 
@@ -738,8 +789,28 @@ function Vibrations() {
           setDualDatasetStatus(result.dual_dataset);
         }
 
-        showToast(`🎯 MLP trained! Accuracy: ${accuracy}%`, 'success');
-        setStatus(`🎯 MLP ready! Accuracy: ${accuracy}% (HOME: ${result.metrics?.home_samples || 0}, Synthetic INTRUDER: ${result.metrics?.intruder_samples || 0})`);
+        // Store detailed training results
+        setTrainingDetails({
+          accuracy,
+          cvAccuracy,
+          cvStd,
+          cvScores,
+          nFolds,
+          homeSamples: result.metrics?.home_samples || 0,
+          intruderSamples: result.metrics?.intruder_samples || 0,
+          totalSamples: result.metrics?.total_samples || 0,
+          datasets: result.dataset_details?.datasets || [],
+          datasetNames: result.dataset_details?.dataset_names || [],
+          selectedDatasets: result.dataset_details?.selected_datasets || selectedDatasets
+        });
+
+        // Auto-show training details panel
+        setShowTrainingDetails(true);
+
+        // Show CV results if available
+        const cvInfo = cvAccuracy !== null ? ` (CV: ${cvAccuracy}% ± ${cvStd}%)` : '';
+        showToast(`🎯 MLP trained! Accuracy: ${accuracy}%${cvInfo}`, 'success');
+        setStatus(`🎯 MLP ready! Accuracy: ${accuracy}%${cvInfo}`);
       } else {
         throw new Error(result.error || 'Training failed');
       }
@@ -930,30 +1001,53 @@ function Vibrations() {
   };
 
   // ============== CHART DATA ==============
+  // Build datasets array - base datasets first
+  const chartDatasets = [
+    {
+      label: "Amplified Signal",
+      data: amplifiedData.map(d => d.value),
+      borderColor: "#00eaff",
+      backgroundColor: "rgba(0,234,255,0.15)",
+      borderWidth: 1.5,
+      pointRadius: 0,
+      fill: true,
+      tension: 0.1
+    },
+    {
+      label: "Captured Event",
+      data: amplifiedData.map(d => d.isEvent ? d.value : null),
+      borderColor: "#ff0055",
+      backgroundColor: "rgba(255, 0, 85, 0.3)",
+      borderWidth: 2,
+      pointRadius: 0,
+      fill: true,
+      tension: 0.1
+    }
+  ];
+
+  // Add manual capture highlight if active
+  if (captureHighlight) {
+    chartDatasets.push({
+      label: `📸 Captured (${captureHighlight.samples} samples)`,
+      data: amplifiedData.map((d, idx) => {
+        if (idx >= captureHighlight.startIdx && idx < captureHighlight.endIdx) {
+          return d.value;
+        }
+        return null;
+      }),
+      borderColor: "#fbbf24",
+      backgroundColor: "rgba(251, 191, 36, 0.4)",
+      borderWidth: 3,
+      pointRadius: 0,
+      fill: true,
+      tension: 0.1,
+      order: -1
+    });
+  }
+
   const amplifiedChartData = {
     labels: amplifiedData.map(d => d.time.toFixed(2)),
-    datasets: [
-      {
-        label: "Amplified Signal",
-        data: amplifiedData.map(d => d.value),
-        borderColor: "#00eaff",
-        backgroundColor: "rgba(0,234,255,0.15)",
-        borderWidth: 1.5,
-        pointRadius: 0,
-        fill: true,
-        tension: 0.1
-      },
-      {
-        label: "Captured Event",
-        data: amplifiedData.map(d => d.isEvent ? d.value : null),
-        borderColor: "#ff0055",
-        backgroundColor: "rgba(255, 0, 85, 0.3)",
-        borderWidth: 2,
-        pointRadius: 0,
-        fill: true,
-        tension: 0.1
-      }
-    ]
+    datasets: chartDatasets
   };
 
   const fftChartData = {
@@ -1007,45 +1101,16 @@ function Vibrations() {
       </div>
 
       {/* SAVE LABEL SELECTOR + SETTINGS */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-        {/* LABEL SELECTOR - HOME or INTRUDER */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+        {/* PERSON NAME INPUT - Always saves as HOME */}
         <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700">
-          <label className="block text-sm text-gray-400 mb-2 font-semibold">💾 Save Samples As:</label>
+          <label className="block text-sm text-gray-400 mb-2 font-semibold">👤 Person Name for Dataset:</label>
           <div className="flex gap-2 mb-2">
-            <button
-              onClick={() => setSaveLabel('HOME')}
-              className={`flex-1 py-3 rounded-xl font-bold transition-all flex items-center justify-center gap-2 ${saveLabel === 'HOME'
-                ? 'bg-gradient-to-r from-green-500 to-emerald-500 text-white shadow-lg shadow-green-500/30'
-                : 'bg-gray-700 text-gray-400 hover:bg-gray-600'
-                }`}
-            >
-              <CheckCircle className="w-5" /> HOME
-            </button>
-            <button
-              onClick={() => setSaveLabel('INTRUDER')}
-              className={`flex-1 py-3 rounded-xl font-bold transition-all flex items-center justify-center gap-2 ${saveLabel === 'INTRUDER'
-                ? 'bg-gradient-to-r from-red-500 to-orange-500 text-white shadow-lg shadow-red-500/30'
-                : 'bg-gray-700 text-gray-400 hover:bg-gray-600'
-                }`}
-            >
-              <AlertTriangle className="w-5" /> INTRUDER
-            </button>
-          </div>
-          <p className="text-xs text-gray-500">
-            {saveLabel === 'HOME'
-              ? '✅ Training data for HOME recognition'
-              : '⚠️ Binary fallback training (optional)'}
-          </p>
-        </div>
-
-        <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700">
-          <label className="block text-sm text-gray-400 mb-2">Person Name (Optional):</label>
-          <div className="flex gap-2">
             <input
               type="text"
               value={labelName}
               onChange={(e) => setLabelName(e.target.value)}
-              placeholder="e.g., Pranshul, Aditi..."
+              placeholder="e.g., Pranshul, Aditi, Samir..."
               className="flex-1 text-white bg-gray-700 p-3 rounded-lg border border-gray-600 focus:border-cyan-500 focus:outline-none"
               onKeyPress={(e) => e.key === 'Enter' && showToast(`✅ Label: ${getEffectiveLabel()}`, 'success')}
             />
@@ -1056,8 +1121,9 @@ function Vibrations() {
               Set
             </button>
           </div>
-          <p className="text-xs text-gray-500 mt-2">
-            Saving as: <strong className={`text-base ${saveLabel === 'HOME' ? 'text-green-400' : 'text-red-400'}`}>{getEffectiveLabel()}</strong>
+          <p className="text-xs text-gray-500">
+            Saving as: <strong className="text-base text-green-400">{getEffectiveLabel()}</strong>
+            <span className="ml-2 text-gray-600">• INTRUDER is detected by MLP, not stored</span>
           </p>
         </div>
 
@@ -1216,6 +1282,14 @@ function Vibrations() {
           </button>
         )}
 
+        {/* Capture Highlight Indicator */}
+        {captureHighlight && (
+          <div className="bg-yellow-500/20 border border-yellow-500 px-4 py-3 rounded-xl flex gap-2 items-center font-medium text-yellow-300 animate-pulse">
+            <span className="text-lg">📸</span>
+            <span>Captured {captureHighlight.samples} samples ({(captureHighlight.samples / 200 * 1000).toFixed(0)}ms) - shown in yellow on graph</span>
+          </div>
+        )}
+
         <button
           onClick={handleSaveTrainData}
           disabled={isSaving || validatedEvents.length === 0}
@@ -1237,17 +1311,7 @@ function Vibrations() {
           Clear
         </button>
 
-        {/* Train MLP Model */}
-        <button
-          onClick={handleTrainMLP}
-          disabled={isTraining || dualDatasetStatus.home_csv?.samples < 5}
-          className="bg-gradient-to-r from-purple-500 to-indigo-500 px-5 py-3 rounded-xl flex gap-2 items-center font-semibold disabled:opacity-50 disabled:cursor-not-allowed hover:from-purple-600 hover:to-indigo-600 transition-all shadow-lg shadow-purple-500/20"
-        >
-          {isTraining ? <RefreshCw className="animate-spin w-5" /> : <BrainCircuit className="w-5" />}
-          🧠 Train MLP
-        </button>
-
-        {/* Predict with MLP (Manual) */}
+        {/* Predict with MLP (Manual) - keep here for quick access */}
         {mlpModelStatus.trained && (
           <button
             onClick={handlePredictMLP}
@@ -1409,7 +1473,7 @@ function Vibrations() {
         </div>
       </div>
 
-      {/* PREDICTION RESULT */}
+      {/* PREDICTION RESULT - Collapsible */}
       {prediction && prediction.formatted && (
         <div className={`mb-6 p-5 rounded-xl border-2 transition-all ${prediction.color_code === 'red'
           ? 'bg-red-900/50 border-red-500 shadow-lg shadow-red-500/30 animate-pulse'
@@ -1421,7 +1485,16 @@ function Vibrations() {
             <div className="text-xl font-bold">
               {prediction.is_intruder ? '🚨 INTRUDER!' : prediction.confidence >= 0.5 ? '✅ FAMILY' : '⚠ UNCERTAIN'}
             </div>
-            {prediction.alert && <span className="text-sm opacity-75">{prediction.alert}</span>}
+            <div className="flex items-center gap-3">
+              {prediction.alert && <span className="text-sm opacity-75">{prediction.alert}</span>}
+              <button
+                onClick={() => setPrediction(null)}
+                className="p-2 hover:bg-gray-700/50 rounded-lg transition text-gray-400 hover:text-white"
+                title="Close prediction"
+              >
+                ✕
+              </button>
+            </div>
           </div>
           <div className="text-4xl font-bold mb-2">{prediction.formatted.person}</div>
           <div className="text-xl mb-2">Confidence: {prediction.formatted.confidenceDisplay}</div>
@@ -1532,6 +1605,236 @@ function Vibrations() {
           </div>
         </div>
       </div>
+
+      {/* ============== MLP TRAINING CENTER ============== */}
+      <div className="bg-gradient-to-br from-purple-900/40 to-indigo-900/40 p-5 rounded-xl border border-purple-700/50 mb-6">
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-3">
+            <BrainCircuit className="w-6 text-purple-400" />
+            <div>
+              <h3 className="text-lg font-bold">🧠 MLP Training Center</h3>
+              <p className="text-sm text-gray-400">Select datasets and train your model with K-Fold Cross-Validation</p>
+            </div>
+          </div>
+          <div className={`px-3 py-1 rounded-full text-sm font-medium ${mlpModelStatus.trained
+            ? 'bg-green-500/20 text-green-400 border border-green-500/30'
+            : 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30'
+            }`}>
+            {mlpModelStatus.trained ? `✅ Trained (${mlpModelStatus.accuracy}%)` : '⏳ Not Trained'}
+          </div>
+        </div>
+
+        {/* Dataset Selection */}
+        <div className="mb-4">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-sm font-semibold text-gray-300">📁 Select Datasets for Training</span>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setSelectedDatasets(availableDatasets)}
+                className="text-xs bg-purple-600/30 hover:bg-purple-600/50 px-2 py-1 rounded transition"
+              >
+                Select All
+              </button>
+              <button
+                onClick={() => setSelectedDatasets([])}
+                className="text-xs bg-gray-600/30 hover:bg-gray-600/50 px-2 py-1 rounded transition"
+              >
+                Clear All
+              </button>
+            </div>
+          </div>
+
+          {availableDatasets.length > 0 ? (
+            <div className="flex flex-wrap gap-2 p-3 bg-gray-800/50 rounded-lg border border-gray-700">
+              {availableDatasets.map((dataset) => {
+                const isSelected = selectedDatasets.includes(dataset);
+                const datasetInfo = dualDatasetStatus.home_csv?.persons_details?.[dataset] || {};
+                const sampleCount = Object.entries(sampleCounts).find(([k]) => k === dataset)?.[1] || 0;
+
+                return (
+                  <button
+                    key={dataset}
+                    onClick={() => {
+                      if (isSelected) {
+                        setSelectedDatasets(selectedDatasets.filter(d => d !== dataset));
+                      } else {
+                        setSelectedDatasets([...selectedDatasets, dataset]);
+                      }
+                    }}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg border transition-all ${isSelected
+                      ? 'bg-purple-600/40 border-purple-500 text-purple-200 shadow-lg shadow-purple-500/20'
+                      : 'bg-gray-700/40 border-gray-600 text-gray-300 hover:bg-gray-700/60'
+                      }`}
+                  >
+                    <div className={`w-4 h-4 rounded border-2 flex items-center justify-center ${isSelected ? 'bg-purple-500 border-purple-400' : 'border-gray-500'
+                      }`}>
+                      {isSelected && <CheckCircle className="w-3 h-3 text-white" />}
+                    </div>
+                    <User className="w-4 h-4" />
+                    <span className="font-medium">{dataset}</span>
+                    <span className="text-xs bg-gray-600/60 px-2 py-0.5 rounded">
+                      {sampleCount} samples
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="p-4 bg-gray-800/50 rounded-lg border border-gray-700 text-center text-gray-400">
+              No datasets available. Save some footstep events first!
+            </div>
+          )}
+
+          <div className="mt-2 text-xs text-gray-500">
+            Selected: {selectedDatasets.length} of {availableDatasets.length} datasets
+            ({selectedDatasets.length > 0 ? selectedDatasets.join(', ') : 'None'})
+          </div>
+        </div>
+
+        {/* Training Actions */}
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            onClick={handleTrainMLP}
+            disabled={isTraining || selectedDatasets.length === 0}
+            className="bg-gradient-to-r from-purple-500 to-indigo-500 px-6 py-3 rounded-xl flex gap-2 items-center font-bold disabled:opacity-50 disabled:cursor-not-allowed hover:from-purple-600 hover:to-indigo-600 transition-all shadow-lg shadow-purple-500/30"
+          >
+            {isTraining ? (
+              <>
+                <RefreshCw className="animate-spin w-5" />
+                Training...
+              </>
+            ) : (
+              <>
+                <BrainCircuit className="w-5" />
+                🧠 Train MLP Model
+              </>
+            )}
+          </button>
+
+          {mlpModelStatus.trained && (
+            <button
+              onClick={() => setShowTrainingDetails(!showTrainingDetails)}
+              className="bg-gray-700 hover:bg-gray-600 px-4 py-3 rounded-xl flex gap-2 items-center transition"
+            >
+              {showTrainingDetails ? <EyeOff className="w-5" /> : <Eye className="w-5" />}
+              {showTrainingDetails ? 'Hide' : 'Show'} Training Details
+            </button>
+          )}
+
+          <div className="ml-auto text-sm text-gray-400">
+            {selectedDatasets.length === 0
+              ? '⚠️ Select at least one dataset'
+              : `Ready to train on ${selectedDatasets.length} dataset(s)`}
+          </div>
+        </div>
+      </div>
+
+      {/* DETAILED TRAINING RESULTS PANEL */}
+      {showTrainingDetails && trainingDetails && (
+        <div className="mb-6 p-4 bg-gradient-to-br from-indigo-900/60 to-purple-900/60 rounded-xl border border-indigo-600 shadow-lg">
+          <div className="flex items-center justify-between mb-4">
+            <div className="font-bold text-lg flex items-center gap-2">
+              <Brain className="w-5 text-indigo-400" />
+              MLP Training Report
+            </div>
+            <button
+              onClick={() => setShowTrainingDetails(false)}
+              className="text-gray-400 hover:text-white transition-colors p-1"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+
+          {/* Accuracy Section */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+            <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+              <div className="text-2xl font-bold text-green-400">{trainingDetails.accuracy}%</div>
+              <div className="text-xs text-gray-400">Final Accuracy</div>
+            </div>
+            <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+              <div className="text-2xl font-bold text-blue-400">
+                {trainingDetails.cvAccuracy ?? 'N/A'}%
+              </div>
+              <div className="text-xs text-gray-400">CV Accuracy</div>
+            </div>
+            <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+              <div className="text-2xl font-bold text-yellow-400">±{trainingDetails.cvStd ?? 0}%</div>
+              <div className="text-xs text-gray-400">Std Dev</div>
+            </div>
+            <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+              <div className="text-2xl font-bold text-purple-400">{trainingDetails.nFolds}</div>
+              <div className="text-xs text-gray-400">Folds</div>
+            </div>
+          </div>
+
+          {/* Cross-Validation Scores */}
+          {trainingDetails.cvScores?.length > 0 && (
+            <div className="mb-4">
+              <div className="text-sm font-semibold text-gray-300 mb-2">
+                📊 Cross-Validation Fold Scores
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {trainingDetails.cvScores.map((score, idx) => (
+                  <div
+                    key={idx}
+                    className={`px-3 py-1 rounded-full text-sm font-medium ${score >= 90 ? 'bg-green-600/40 text-green-300' :
+                      score >= 80 ? 'bg-yellow-600/40 text-yellow-300' :
+                        'bg-red-600/40 text-red-300'
+                      }`}
+                  >
+                    Fold {idx + 1}: {score}%
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Sample Distribution */}
+          <div className="grid grid-cols-3 gap-3 mb-4">
+            <div className="bg-gray-800/60 rounded-lg p-3">
+              <div className="text-lg font-bold text-cyan-400">{trainingDetails.homeSamples}</div>
+              <div className="text-xs text-gray-400">HOME Samples</div>
+            </div>
+            <div className="bg-gray-800/60 rounded-lg p-3">
+              <div className="text-lg font-bold text-orange-400">{trainingDetails.intruderSamples}</div>
+              <div className="text-xs text-gray-400">INTRUDER (Synthetic)</div>
+            </div>
+            <div className="bg-gray-800/60 rounded-lg p-3">
+              <div className="text-lg font-bold text-white">{trainingDetails.totalSamples}</div>
+              <div className="text-xs text-gray-400">Total Samples</div>
+            </div>
+          </div>
+
+          {/* Datasets Used */}
+          {trainingDetails.datasets?.length > 0 && (
+            <div>
+              <div className="text-sm font-semibold text-gray-300 mb-2">
+                📁 Datasets Used for Training
+              </div>
+              <div className="bg-gray-800/60 rounded-lg p-3">
+                <div className="flex flex-wrap gap-2">
+                  {trainingDetails.datasets.map((dataset, idx) => (
+                    <div
+                      key={idx}
+                      className="flex items-center gap-2 px-3 py-2 bg-gray-700/60 rounded-lg border border-gray-600"
+                    >
+                      <User className="w-4 h-4 text-emerald-400" />
+                      <span className="font-medium text-emerald-300">{dataset.name}</span>
+                      <span className="text-xs text-gray-400 bg-gray-600/60 px-2 py-0.5 rounded">
+                        {dataset.samples} samples
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-2 text-xs text-gray-500">
+                  Total {trainingDetails.datasets.length} dataset(s) •
+                  {trainingDetails.datasetNames?.join(', ')}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* RESET & DATASET MANAGER */}
       <div className="bg-gray-800/50 p-4 rounded-xl border border-red-900/30 mb-6">

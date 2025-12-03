@@ -288,12 +288,16 @@ export const api = {
     /**
      * Train Simple MLP model
      * Uses dual dataset (HOME.csv), generates synthetic INTRUDER samples
+     * @param {string[]} selectedDatasets - Optional array of dataset names to train on
      * @returns {Promise<{success: boolean, metrics: Object, dual_dataset: Object}>}
      */
-    async trainMLP() {
+    async trainMLP(selectedDatasets = null) {
         const response = await fetch(`${API_BASE_URL}${ENDPOINTS.TRAIN_MLP}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                selected_datasets: selectedDatasets
+            }),
         });
 
         if (!response.ok) {
