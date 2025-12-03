@@ -14,20 +14,26 @@ export const ENDPOINTS = {
     DATASET_UPLOAD: '/dataset/upload',
     TRAIN: '/train',
     FEATURES: '/model/features',
+    // NEW MLP Endpoints
+    TRAIN_MLP: '/train_mlp',
+    PREDICT_MLP: '/predict_mlp',
+    DATASET_STATUS: '/dataset_status',
 };
 
-// One-class anomaly detection labels
-// Only HOME is needed for training - INTRUDER is detected as anomaly
+// HOME/INTRUDER Classification labels
+// HOME samples are used for training, INTRUDER detected by MLP rules
 export const LABELS = {
     HOME: 'HOME',
-    INTRUDER: 'INTRUDER'  // Detected as anomaly, not trained
+    INTRUDER: 'INTRUDER'
 };
 
-// Model type - One-Class Anomaly Detection
+// Model type - Simple MLP (150 samples → 92% accuracy)
 export const MODEL_CONFIG = {
-    type: 'One-Class Anomaly Detection',
-    trainingLabel: 'HOME',  // Only HOME samples used for training
-    description: 'Trains on HOME footsteps only. Intruders detected as anomalies.'
+    type: 'Simple MLP Classifier',
+    trainingLabel: 'HOME',
+    targetSamples: 150,
+    targetAccuracy: 92,
+    description: 'Dual dataset saving with MLP model and prediction rules.'
 };
 
 // Serial/Buffer Configuration
@@ -272,6 +278,64 @@ export const api = {
 
         if (!response.ok) {
             throw new Error(`Failed to fetch features: ${response.status}`);
+        }
+
+        return response.json();
+    },
+
+    // ============== NEW MLP METHODS ==============
+
+    /**
+     * Train Simple MLP model
+     * Uses dual dataset (HOME.csv), generates synthetic INTRUDER samples
+     * @returns {Promise<{success: boolean, metrics: Object, dual_dataset: Object}>}
+     */
+    async trainMLP() {
+        const response = await fetch(`${API_BASE_URL}${ENDPOINTS.TRAIN_MLP}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+        });
+
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.detail || `MLP training failed: ${response.status}`);
+        }
+
+        return response.json();
+    },
+
+    /**
+     * Predict using MLP with prediction rules
+     * @param {number[]} data - Array of raw ADC values
+     * @returns {Promise<{prediction: string, confidence: number, is_intruder: boolean, ...}>}
+     */
+    async predictMLP(data) {
+        const response = await fetch(`${API_BASE_URL}${ENDPOINTS.PREDICT_MLP}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ data: data }),
+        });
+
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.detail || `MLP prediction failed: ${response.status}`);
+        }
+
+        return response.json();
+    },
+
+    /**
+     * Get detailed dual dataset status
+     * @returns {Promise<{dual_dataset: Object, sample_counts: Object, mlp_model: Object, ...}>}
+     */
+    async getDatasetStatus() {
+        const response = await fetch(`${API_BASE_URL}${ENDPOINTS.DATASET_STATUS}`, {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+        });
+
+        if (!response.ok) {
+            throw new Error(`Dataset status fetch failed: ${response.status}`);
         }
 
         return response.json();

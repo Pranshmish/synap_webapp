@@ -30,6 +30,26 @@ export default defineConfig({
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
+      '/train_mlp': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/predict_mlp': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/dataset_status': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/train': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/model': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
     },
   },
   build: {

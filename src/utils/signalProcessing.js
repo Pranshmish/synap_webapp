@@ -30,8 +30,8 @@ export const DETECTION_CONFIG = {
 
     // === NOISE FLOOR TRACKING (Rolling MAD) ===
     NOISE_WINDOW_SAMPLES: 100,   // 500ms at 200Hz
-    ADAPTIVE_THRESHOLD_MULT: 2.0, // Signal must be 2.0x MAD to trigger (lowered for sensitivity)
-    MIN_NOISE_FLOOR: 0.015,      // Minimum noise floor (normalized, lowered)
+    ADAPTIVE_THRESHOLD_MULT: 2.9, // Signal must be 2.9x MAD to trigger (optimized value)
+    MIN_NOISE_FLOOR: 0.015,      // Minimum noise floor (normalized) - locked to 0.0150
 
     // === ENERGY-TRIGGERED DETECTION ===
     ENERGY_WINDOW_MS: 22,        // ~4 samples at 200Hz
@@ -50,7 +50,7 @@ export const DETECTION_CONFIG = {
     MAX_DURATION_MS: 400,        // Maximum footstep length (increased)
     MIN_DURATION_SAMPLES: 4,     // ~20ms at 200Hz
     MAX_DURATION_SAMPLES: 80,    // ~400ms at 200Hz
-    MIN_RMS_RAW: 0.01,           // Minimum RMS (normalized, lowered for sensitivity)
+    MIN_RMS_RAW: 0.005,          // Minimum RMS (very low - any visible signal passes)
 
     // === SPECTRAL VALIDATION ===
     SPECTRAL_PEAK_LOW_HZ: 20,
@@ -88,8 +88,8 @@ export const SENSITIVITY_PRESETS = {
     medium: {
         name: '🔉 Medium',
         description: 'Balanced (recommended)',
-        ADAPTIVE_THRESHOLD_MULT: 2.0,
-        MIN_RMS_RAW: 0.02,
+        ADAPTIVE_THRESHOLD_MULT: 2.9,
+        MIN_RMS_RAW: 0.005,
         MIN_DURATION_MS: 20,
         GAIN: 50.0
     },
