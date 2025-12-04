@@ -123,6 +123,48 @@ function Vibrations() {
   const [selectedDatasets, setSelectedDatasets] = useState([]); // Selected datasets for training
   const [availableDatasets, setAvailableDatasets] = useState([]); // Available datasets from backend
 
+  // ============== MULTI-MODEL STATE ==============
+  const [selectedModel, setSelectedModel] = useState('MLPClassifier'); // Default model
+  const [activeModel, setActiveModel] = useState('MLPClassifier'); // Currently active model
+  const [availableModels, setAvailableModels] = useState([
+    // Default models (will be updated from backend)
+    {
+      name: 'RandomForestEnsemble',
+      display_name: 'Random Forest + Isolation Forest',
+      short_name: 'RF',
+      description: 'Ensemble classifier with anomaly detection',
+      ready: true,
+      trained: false,
+      cv_accuracy: 0,
+      is_active: false
+    },
+    {
+      name: 'MLPClassifier',
+      display_name: 'MLP Neural Network',
+      short_name: 'MLP',
+      description: 'Multi-layer perceptron classifier',
+      ready: true,
+      trained: false,
+      cv_accuracy: 0,
+      is_active: true
+    },
+    {
+      name: 'HybridLSTMSNN',
+      display_name: 'Hybrid LSTM + SNN',
+      short_name: 'Hybrid',
+      description: 'LSTM + Spiking Neural Network (Coming Soon)',
+      ready: false,
+      trained: false,
+      cv_accuracy: 0,
+      is_active: false
+    }
+  ]);
+  const [modelsStatus, setModelsStatus] = useState({
+    RandomForestEnsemble: { short_name: 'RF', display_name: 'Random Forest + Isolation Forest', trained: false, ready: true },
+    MLPClassifier: { short_name: 'MLP', display_name: 'MLP Neural Network', trained: false, ready: true },
+    HybridLSTMSNN: { short_name: 'Hybrid', display_name: 'Hybrid LSTM + SNN', trained: false, ready: false }
+  });
+
   // ============== DUAL DATASET STATUS ==============
   const [dualDatasetStatus, setDualDatasetStatus] = useState({
     home_csv: { samples: 0, persons: [] },
@@ -315,6 +357,25 @@ function Vibrations() {
         }
       } catch (e) {
         console.log("Dataset status not available (backend may need update)", e);
+      }
+
+      // Fetch available models
+      try {
+        const modelsResult = await api.getAvailableModels();
+        console.log('[fetchStatus] Available models:', modelsResult);
+        if (modelsResult.models) {
+          setAvailableModels(modelsResult.models);
+          setActiveModel(modelsResult.active_model || 'MLPClassifier');
+
+          // Build models status object
+          const statusObj = {};
+          modelsResult.models.forEach(m => {
+            statusObj[m.name] = m;
+          });
+          setModelsStatus(statusObj);
+        }
+      } catch (e) {
+        console.log("Models status not available (backend may need update)", e);
       }
     } catch (error) {
       console.error("Failed to fetch status:", error);
@@ -813,21 +874,24 @@ function Vibrations() {
     }
   };
 
-  // ============== TRAIN MLP MODEL ==============
-  const handleTrainMLP = async () => {
+  // ============== TRAIN SELECTED MODEL ==============
+  const handleTrainModel = async () => {
     if (selectedDatasets.length === 0) {
       showToast('⚠️ Please select at least one dataset to train on', 'warning');
       return;
     }
 
+    const modelInfo = availableModels.find(m => m.name === selectedModel);
+    const modelDisplayName = modelInfo?.short_name || selectedModel;
+
     setIsTraining(true);
-    setStatus(`🧠 Training MLP on ${selectedDatasets.length} dataset(s)...`);
+    setStatus(`🧠 Training ${modelDisplayName} on ${selectedDatasets.length} dataset(s)...`);
     setTrainingDetails(null);
     setShowTrainingDetails(false);
 
     try {
-      // Pass selected datasets to backend
-      const result = await api.trainMLP(selectedDatasets);
+      // Use the multi-model training endpoint
+      const result = await api.trainSelectedModel(selectedModel, selectedDatasets);
 
       if (result.success) {
         const accuracy = result.metrics?.training_accuracy ?? 0;
@@ -837,7 +901,11 @@ function Vibrations() {
         const nFolds = result.metrics?.n_folds ?? 5;
 
         setTrainingMetrics(result.metrics);
-        setMlpModelStatus({ trained: true, accuracy });
+
+        // Update model status based on which model was trained
+        if (selectedModel === 'MLPClassifier') {
+          setMlpModelStatus({ trained: true, accuracy: cvAccuracy || accuracy });
+        }
 
         if (result.dual_dataset) {
           setDualDatasetStatus(result.dual_dataset);
@@ -845,6 +913,8 @@ function Vibrations() {
 
         // Store detailed training results
         setTrainingDetails({
+          modelName: selectedModel,
+          modelDisplayName,
           accuracy,
           cvAccuracy,
           cvStd,
@@ -855,7 +925,8 @@ function Vibrations() {
           totalSamples: result.metrics?.total_samples || 0,
           datasets: result.dataset_details?.datasets || [],
           datasetNames: result.dataset_details?.dataset_names || [],
-          selectedDatasets: result.dataset_details?.selected_datasets || selectedDatasets
+          selectedDatasets: result.dataset_details?.selected_datasets || selectedDatasets,
+          topFeatures: result.top_features || []
         });
 
         // Auto-show training details panel
@@ -863,18 +934,90 @@ function Vibrations() {
 
         // Show CV results if available
         const cvInfo = cvAccuracy !== null ? ` (CV: ${cvAccuracy}% ± ${cvStd}%)` : '';
-        showToast(`🎯 MLP trained! Accuracy: ${accuracy}%${cvInfo}`, 'success');
-        setStatus(`🎯 MLP ready! Accuracy: ${accuracy}%${cvInfo}`);
+        showToast(`🎯 ${modelDisplayName} trained! Accuracy: ${accuracy}%${cvInfo}`, 'success');
+        setStatus(`🎯 ${modelDisplayName} ready! Accuracy: ${accuracy}%${cvInfo}`);
       } else {
         throw new Error(result.error || 'Training failed');
       }
 
       await fetchStatus();
     } catch (error) {
-      showToast(`❌ MLP Training failed: ${error.message}`, 'error');
-      setStatus(`❌ MLP Training failed: ${error.message}`);
+      showToast(`❌ ${modelDisplayName} Training failed: ${error.message}`, 'error');
+      setStatus(`❌ ${modelDisplayName} Training failed: ${error.message}`);
     } finally {
       setIsTraining(false);
+    }
+  };
+
+  // Legacy alias for MLP training (backward compatibility)
+  const handleTrainMLP = handleTrainModel;
+
+  // ============== SET ACTIVE MODEL ==============
+  const handleSetActiveModel = async (modelName) => {
+    const modelInfo = availableModels.find(m => m.name === modelName);
+    if (!modelInfo?.trained) {
+      showToast(`⚠️ ${modelInfo?.short_name || modelName} is not trained yet. Train it first!`, 'warning');
+      return;
+    }
+
+    try {
+      const result = await api.setActiveModel(modelName);
+      if (result.success) {
+        setActiveModel(modelName);
+        showToast(`✅ Switched to ${modelInfo?.short_name || modelName} for predictions`, 'success');
+        await fetchStatus();
+      }
+    } catch (error) {
+      showToast(`❌ Failed to switch model: ${error.message}`, 'error');
+    }
+  };
+
+  // ============== PREDICT WITH SELECTED MODEL ==============
+  const handlePredictWithModel = async () => {
+    if (validatedEvents.length === 0) {
+      return showToast("⚠ No footstep events to predict.", "warning");
+    }
+
+    const modelInfo = modelsStatus[activeModel];
+    if (!modelInfo?.trained) {
+      return showToast(`⚠ ${activeModel} not trained. Train first!`, "warning");
+    }
+
+    setIsPredicting(true);
+    const modelName = modelInfo?.short_name || activeModel;
+    setStatus(`🔮 Predicting with ${modelName}...`);
+
+    const lastEvent = validatedEvents[validatedEvents.length - 1];
+    const backendData = FootstepEventDetector.toBackendFormat(lastEvent);
+
+    if (!backendData) {
+      showToast("⚠ Invalid event data", "warning");
+      setIsPredicting(false);
+      return;
+    }
+
+    try {
+      const result = await api.predictWithModel(backendData, activeModel);
+
+      const formatted = formatPrediction(result);
+      setPrediction({ ...result, formatted, model_used: activeModel });
+
+      if (result.is_intruder) {
+        alarmRef.current?.play();
+        showToast(`🚨 ${result.prediction} (${modelName})`, 'error');
+        setStatus(`🚨 ${result.alert} [${modelName}]`);
+      } else if (result.color_code === 'yellow') {
+        showToast(`⚠ ${result.prediction} (${modelName})`, 'warning');
+        setStatus(`⚠ ${result.alert} [${modelName}]`);
+      } else {
+        showToast(`✅ ${result.prediction} (${modelName})`, 'success');
+        setStatus(`✅ ${result.alert} [${modelName}]`);
+      }
+    } catch (error) {
+      showToast(`❌ Prediction failed: ${error.message}`, 'error');
+      setStatus(`❌ Prediction failed: ${error.message}`);
+    } finally {
+      setIsPredicting(false);
     }
   };
 
@@ -1666,21 +1809,86 @@ function Vibrations() {
         </div>
       </div>
 
-      {/* ============== MLP TRAINING CENTER ============== */}
+      {/* ============== MULTI-MODEL TRAINING CENTER ============== */}
       <div className="bg-gradient-to-br from-purple-900/40 to-indigo-900/40 p-5 rounded-xl border border-purple-700/50 mb-6">
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-3">
             <BrainCircuit className="w-6 text-purple-400" />
             <div>
-              <h3 className="text-lg font-bold">🧠 MLP Training Center</h3>
-              <p className="text-sm text-gray-400">Select datasets and train your model with K-Fold Cross-Validation</p>
+              <h3 className="text-lg font-bold">🧠 Model Training Center</h3>
+              <p className="text-sm text-gray-400">Select model type, datasets, and train with K-Fold Cross-Validation</p>
             </div>
           </div>
-          <div className={`px-3 py-1 rounded-full text-sm font-medium ${mlpModelStatus.trained
-            ? 'bg-green-500/20 text-green-400 border border-green-500/30'
-            : 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30'
-            }`}>
-            {mlpModelStatus.trained ? `✅ Trained (${mlpModelStatus.accuracy}%)` : '⏳ Not Trained'}
+          <div className="flex items-center gap-2">
+            {/* Active Model Status */}
+            <div className={`px-3 py-1 rounded-full text-sm font-medium ${modelsStatus[activeModel]?.trained
+              ? 'bg-green-500/20 text-green-400 border border-green-500/30'
+              : 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30'
+              }`}>
+              Active: {modelsStatus[activeModel]?.short_name || 'MLP'}
+              {modelsStatus[activeModel]?.trained ? ` (${modelsStatus[activeModel]?.cv_accuracy || 0}%)` : ' - Not Trained'}
+            </div>
+          </div>
+        </div>
+
+        {/* Model Selector Dropdown */}
+        <div className="mb-4 p-4 bg-gray-800/50 rounded-lg border border-gray-700">
+          <div className="flex items-center justify-between mb-3">
+            <span className="text-sm font-semibold text-gray-300">🎯 Select Model Type</span>
+            <span className="text-xs text-gray-500">Choose the ML model to train</span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {availableModels.map((model) => (
+              <button
+                key={model.name}
+                onClick={() => setSelectedModel(model.name)}
+                disabled={!model.ready}
+                className={`p-3 rounded-lg border-2 transition-all text-left ${selectedModel === model.name
+                  ? 'bg-purple-600/30 border-purple-500 shadow-lg shadow-purple-500/20'
+                  : model.ready
+                    ? 'bg-gray-700/30 border-gray-600 hover:border-gray-500'
+                    : 'bg-gray-800/30 border-gray-700 opacity-50 cursor-not-allowed'
+                  }`}
+              >
+                <div className="flex items-center justify-between mb-1">
+                  <span className="font-bold text-sm">{model.short_name}</span>
+                  {model.trained && (
+                    <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded">
+                      {model.cv_accuracy}%
+                    </span>
+                  )}
+                  {!model.ready && (
+                    <span className="text-xs bg-yellow-500/20 text-yellow-400 px-2 py-0.5 rounded">
+                      Soon
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-gray-400">{model.description}</p>
+                {model.is_active && (
+                  <div className="mt-2 text-xs text-cyan-400 flex items-center gap-1">
+                    <CheckCircle className="w-3 h-3" /> Active for predictions
+                  </div>
+                )}
+              </button>
+            ))}
+          </div>
+
+          {/* Quick Model Info */}
+          <div className="mt-3 flex items-center justify-between text-xs text-gray-500">
+            <span>Selected: <span className="text-purple-400 font-medium">{modelsStatus[selectedModel]?.display_name || selectedModel}</span></span>
+            {modelsStatus[selectedModel]?.trained && (
+              <button
+                onClick={() => handleSetActiveModel(selectedModel)}
+                disabled={activeModel === selectedModel}
+                className={`px-2 py-1 rounded transition ${activeModel === selectedModel
+                  ? 'bg-green-600/20 text-green-400 cursor-default'
+                  : 'bg-cyan-600/30 hover:bg-cyan-600/50 text-cyan-300'
+                  }`}
+              >
+                {activeModel === selectedModel ? '✓ Active' : '→ Set as Active'}
+              </button>
+            )}
           </div>
         </div>
 
@@ -1754,37 +1962,84 @@ function Vibrations() {
         {/* Training Actions */}
         <div className="flex flex-wrap items-center gap-3">
           <button
-            onClick={handleTrainMLP}
-            disabled={isTraining || selectedDatasets.length === 0}
+            onClick={handleTrainModel}
+            disabled={isTraining || selectedDatasets.length === 0 || !modelsStatus[selectedModel]?.ready}
             className="bg-gradient-to-r from-purple-500 to-indigo-500 px-6 py-3 rounded-xl flex gap-2 items-center font-bold disabled:opacity-50 disabled:cursor-not-allowed hover:from-purple-600 hover:to-indigo-600 transition-all shadow-lg shadow-purple-500/30"
           >
             {isTraining ? (
               <>
                 <RefreshCw className="animate-spin w-5" />
-                Training...
+                Training {modelsStatus[selectedModel]?.short_name || 'Model'}...
               </>
             ) : (
               <>
                 <BrainCircuit className="w-5" />
-                🧠 Train MLP Model
+                🧠 Train {modelsStatus[selectedModel]?.short_name || 'Model'}
               </>
             )}
           </button>
 
-          {mlpModelStatus.trained && (
+          {/* Predict with Active Model */}
+          <button
+            onClick={handlePredictWithModel}
+            disabled={isPredicting || validatedEvents.length === 0 || !modelsStatus[activeModel]?.trained}
+            className="bg-gradient-to-r from-cyan-500 to-blue-500 px-5 py-3 rounded-xl flex gap-2 items-center font-bold disabled:opacity-50 disabled:cursor-not-allowed hover:from-cyan-600 hover:to-blue-600 transition-all shadow-lg shadow-cyan-500/30"
+          >
+            {isPredicting ? (
+              <>
+                <RefreshCw className="animate-spin w-5" />
+                Predicting...
+              </>
+            ) : (
+              <>
+                <Zap className="w-5" />
+                🔮 Predict ({modelsStatus[activeModel]?.short_name || 'MLP'})
+              </>
+            )}
+          </button>
+
+          {trainingDetails && (
             <button
               onClick={() => setShowTrainingDetails(!showTrainingDetails)}
               className="bg-gray-700 hover:bg-gray-600 px-4 py-3 rounded-xl flex gap-2 items-center transition"
             >
               {showTrainingDetails ? <EyeOff className="w-5" /> : <Eye className="w-5" />}
-              {showTrainingDetails ? 'Hide' : 'Show'} Training Details
+              {showTrainingDetails ? 'Hide' : 'Show'} Details
             </button>
           )}
 
           <div className="ml-auto text-sm text-gray-400">
             {selectedDatasets.length === 0
               ? '⚠️ Select at least one dataset'
-              : `Ready to train on ${selectedDatasets.length} dataset(s)`}
+              : `Ready to train ${modelsStatus[selectedModel]?.short_name || 'model'} on ${selectedDatasets.length} dataset(s)`}
+          </div>
+        </div>
+
+        {/* Models Status Summary */}
+        <div className="mt-4 pt-4 border-t border-gray-700/50">
+          <div className="text-xs text-gray-500 mb-2">📊 Models Overview:</div>
+          <div className="flex flex-wrap gap-2">
+            {availableModels.map((model) => (
+              <div
+                key={model.name}
+                className={`px-3 py-1.5 rounded-lg text-xs flex items-center gap-2 ${model.trained
+                  ? model.is_active
+                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+                    : 'bg-green-500/20 text-green-300 border border-green-500/30'
+                  : 'bg-gray-700/30 text-gray-400 border border-gray-600/30'
+                  }`}
+              >
+                <span className="font-medium">{model.short_name}</span>
+                {model.trained ? (
+                  <span>{model.cv_accuracy}%</span>
+                ) : model.ready ? (
+                  <span>Not trained</span>
+                ) : (
+                  <span>Coming soon</span>
+                )}
+                {model.is_active && <span className="text-cyan-400">★</span>}
+              </div>
+            ))}
           </div>
         </div>
       </div>
@@ -1795,7 +2050,7 @@ function Vibrations() {
           <div className="flex items-center justify-between mb-4">
             <div className="font-bold text-lg flex items-center gap-2">
               <Brain className="w-5 text-indigo-400" />
-              MLP Training Report
+              {trainingDetails.modelDisplayName || 'Model'} Training Report
             </div>
             <button
               onClick={() => setShowTrainingDetails(false)}
@@ -1804,6 +2059,15 @@ function Vibrations() {
               <X className="w-5 h-5" />
             </button>
           </div>
+
+          {/* Model Badge */}
+          {trainingDetails.modelName && (
+            <div className="mb-3">
+              <span className="px-3 py-1 rounded-full text-sm font-medium bg-purple-600/40 text-purple-200 border border-purple-500/30">
+                {trainingDetails.modelName}
+              </span>
+            </div>
+          )}
 
           {/* Accuracy Section */}
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">

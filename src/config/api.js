@@ -14,10 +14,16 @@ export const ENDPOINTS = {
     DATASET_UPLOAD: '/dataset/upload',
     TRAIN: '/train',
     FEATURES: '/model/features',
-    // NEW MLP Endpoints
+    // MLP Endpoints
     TRAIN_MLP: '/train_mlp',
     PREDICT_MLP: '/predict_mlp',
     DATASET_STATUS: '/dataset_status',
+    // Multi-Model Endpoints
+    AVAILABLE_MODELS: '/available_models',
+    TRAIN_SELECTED_MODEL: '/train_selected_model',
+    PREDICT_SELECTED_MODEL: '/predict_selected_model',
+    SET_ACTIVE_MODEL: '/set_active_model',
+    MODEL_STATUS: '/model_status',
 };
 
 // HOME/INTRUDER Classification labels
@@ -340,6 +346,110 @@ export const api = {
 
         if (!response.ok) {
             throw new Error(`Dataset status fetch failed: ${response.status}`);
+        }
+
+        return response.json();
+    },
+
+    // ============== MULTI-MODEL API ==============
+
+    /**
+     * Get list of available models with status
+     * @returns {Promise<{models: Array, active_model: string}>}
+     */
+    async getAvailableModels() {
+        const response = await fetch(`${API_BASE_URL}${ENDPOINTS.AVAILABLE_MODELS}`, {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch models: ${response.status}`);
+        }
+
+        return response.json();
+    },
+
+    /**
+     * Train a specific model type
+     * @param {string} modelName - "RandomForestEnsemble", "MLPClassifier", or "HybridLSTMSNN"
+     * @param {string[]} selectedDatasets - Optional array of dataset names
+     * @returns {Promise<{success: boolean, metrics: Object, model_name: string}>}
+     */
+    async trainSelectedModel(modelName, selectedDatasets = null) {
+        const response = await fetch(`${API_BASE_URL}${ENDPOINTS.TRAIN_SELECTED_MODEL}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model_name: modelName,
+                selected_datasets: selectedDatasets
+            }),
+        });
+
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.detail || `Training failed: ${response.status}`);
+        }
+
+        return response.json();
+    },
+
+    /**
+     * Predict using a specific model
+     * @param {number[]} data - Array of raw ADC values
+     * @param {string} modelName - Model to use (optional, uses active model if not specified)
+     * @returns {Promise<{prediction: string, confidence: number, is_intruder: boolean, model_used: string}>}
+     */
+    async predictWithModel(data, modelName = null) {
+        const response = await fetch(`${API_BASE_URL}${ENDPOINTS.PREDICT_SELECTED_MODEL}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                data: data,
+                model_name: modelName
+            }),
+        });
+
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.detail || `Prediction failed: ${response.status}`);
+        }
+
+        return response.json();
+    },
+
+    /**
+     * Set the active model for predictions
+     * @param {string} modelName - Model to set as active
+     * @returns {Promise<{success: boolean, active_model: string}>}
+     */
+    async setActiveModel(modelName) {
+        const response = await fetch(`${API_BASE_URL}${ENDPOINTS.SET_ACTIVE_MODEL}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model_name: modelName }),
+        });
+
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.detail || `Failed to set model: ${response.status}`);
+        }
+
+        return response.json();
+    },
+
+    /**
+     * Get comprehensive model status
+     * @returns {Promise<{models: Object, active_model: string}>}
+     */
+    async getModelStatus() {
+        const response = await fetch(`${API_BASE_URL}${ENDPOINTS.MODEL_STATUS}`, {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch model status: ${response.status}`);
         }
 
         return response.json();
