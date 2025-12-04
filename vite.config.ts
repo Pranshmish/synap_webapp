@@ -30,6 +30,40 @@ export default defineConfig({
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
+      '/train_mlp': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/predict_mlp': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/dataset_status': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/train': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/model': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+    },
+  },
+  build: {
+    chunkSizeWarningLimit: 1000, // Increase limit to 1MB
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          // Split vendor chunks
+          'vendor-react': ['react', 'react-dom'],
+          'vendor-charts': ['chart.js', 'react-chartjs-2'],
+          'vendor-icons': ['lucide-react'],
+          'vendor-firebase': ['firebase/app', 'firebase/auth'],
+        },
+      },
     },
   },
 });

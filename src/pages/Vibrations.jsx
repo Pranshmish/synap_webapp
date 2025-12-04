@@ -34,6 +34,9 @@ import {
   Download,
   Upload,
   Sliders,
+  Brain,
+  User,
+  X,
 } from "lucide-react";
 
 // Import API and utilities
@@ -67,10 +70,10 @@ ChartJS.register(
 // One-Class Anomaly Detection - Only HOME samples needed for training
 // Intruders are automatically detected as anomalies (outliers from HOME patterns)
 const TRAINING_MODE = {
-  value: "HOME",
-  label: "🏠 HOME Training",
+  value: "FAMILY",
+  label: "🏠 Family Training",
   color: "from-green-500 to-emerald-500",
-  description: "Train on HOME samples only. Intruders detected as anomalies."
+  description: "Train on family members. Intruders detected by low confidence."
 };
 
 // Chart options for better performance
@@ -108,15 +111,67 @@ const fftChartOptions = {
 
 function Vibrations() {
   // ============== CORE STATE ==============
-  // One-Class Anomaly Detection: Always train on HOME, detect intruders as anomalies
-  const sampleMode = "HOME"; // Fixed to HOME for one-class anomaly detection
-  const [labelName, setLabelName] = useState(""); // Custom label name for saving
+  // All data is saved as HOME - INTRUDER is detected by MLP, not stored
+  const [labelName, setLabelName] = useState(""); // Person name (e.g., Apurv, Samir)
   const [status, setStatus] = useState("Idle — Connect serial to begin");
   const [prediction, setPrediction] = useState(null);
   const [isConnected, setIsConnected] = useState(false);
   const [sampleCounts, setSampleCounts] = useState({});
-  const [modelTrained, setModelTrained] = useState(false);
   const [trainingMetrics, setTrainingMetrics] = useState(null);
+  const [trainingDetails, setTrainingDetails] = useState(null); // Detailed training results
+  const [showTrainingDetails, setShowTrainingDetails] = useState(false); // Toggle details panel
+  const [selectedDatasets, setSelectedDatasets] = useState([]); // Selected datasets for training
+  const [availableDatasets, setAvailableDatasets] = useState([]); // Available datasets from backend
+
+  // ============== MULTI-MODEL STATE ==============
+  const [selectedModel, setSelectedModel] = useState('MLPClassifier'); // Default model
+  const [activeModel, setActiveModel] = useState('MLPClassifier'); // Currently active model
+  const [availableModels, setAvailableModels] = useState([
+    // Default models (will be updated from backend)
+    {
+      name: 'RandomForestEnsemble',
+      display_name: 'Random Forest + Isolation Forest',
+      short_name: 'RF',
+      description: 'Ensemble classifier with anomaly detection',
+      ready: true,
+      trained: false,
+      cv_accuracy: 0,
+      is_active: false
+    },
+    {
+      name: 'MLPClassifier',
+      display_name: 'MLP Neural Network',
+      short_name: 'MLP',
+      description: 'Multi-layer perceptron classifier',
+      ready: true,
+      trained: false,
+      cv_accuracy: 0,
+      is_active: true
+    },
+    {
+      name: 'HybridLSTMSNN',
+      display_name: 'Hybrid LSTM + SNN',
+      short_name: 'Hybrid',
+      description: 'LSTM + Spiking Neural Network (Coming Soon)',
+      ready: false,
+      trained: false,
+      cv_accuracy: 0,
+      is_active: false
+    }
+  ]);
+  const [modelsStatus, setModelsStatus] = useState({
+    RandomForestEnsemble: { short_name: 'RF', display_name: 'Random Forest + Isolation Forest', trained: false, ready: true },
+    MLPClassifier: { short_name: 'MLP', display_name: 'MLP Neural Network', trained: false, ready: true },
+    HybridLSTMSNN: { short_name: 'Hybrid', display_name: 'Hybrid LSTM + SNN', trained: false, ready: false }
+  });
+
+  // ============== DUAL DATASET STATUS ==============
+  const [dualDatasetStatus, setDualDatasetStatus] = useState({
+    home_csv: { samples: 0, persons: [] },
+    progress_percent: 0,
+    target_samples: 150
+  });
+  const [mlpModelStatus, setMlpModelStatus] = useState({ trained: false, accuracy: 0 });
 
   // ============== LOADING STATES ==============
   const [isSaving, setIsSaving] = useState(false);
@@ -138,6 +193,7 @@ function Vibrations() {
   const [fftData, setFftData] = useState({ frequencies: [], magnitudes: [] });
   const [lifData, setLifData] = useState([]);
   const [spikeMarkers, setSpikeMarkers] = useState([]);
+  const [captureHighlight, setCaptureHighlight] = useState(null); // {startIdx, endIdx, timestamp} for highlighting captured region
 
   // ============== EVENT DETECTION STATE ==============
   const [validatedEvents, setValidatedEvents] = useState([]);
@@ -145,17 +201,30 @@ function Vibrations() {
   const [detectionStats, setDetectionStats] = useState({
     totalSamples: 0,
     eventsDetected: 0,
-    eventsRejected: 0,
+    noiseRejected: 0,
     lastRejectionReason: null
   });
 
   // ============== MODE FLAGS ==============
   const [autoSaveEnabled, setAutoSaveEnabled] = useState(false);
   const [livePredictEnabled, setLivePredictEnabled] = useState(false);
+  const [manualCaptureMode, setManualCaptureMode] = useState(false);
+  const [predictionMode, setPredictionMode] = useState(false);
+  const [saveAllVisibleMode, setSaveAllVisibleMode] = useState(false); // Save everything visible on graph
+  const manualBufferRef = useRef([]);
+  const visibleBufferRef = useRef([]); // Buffer for Save All Visible mode
+  const lastVisibleSaveRef = useRef(0); // Debounce for visible saves
 
   // ============== SENSITIVITY/THRESHOLD ==============
-  const [sensitivity, setSensitivity] = useState('medium');
-  const [customThreshold, setCustomThreshold] = useState(0.15);
+  const [sensitivity, setSensitivity] = useState('custom'); // Default to custom for 1.5 setting
+  const [customThreshold, setCustomThreshold] = useState(1.5); // Default: 1.5 (user optimized)
+  const [rawGate, setRawGate] = useState(210); // Default: 210 ADC (user optimized)
+  const [spikeThreshold, setSpikeThreshold] = useState(0.2); // Spike threshold for Save All Visible mode
+
+  // ============== ML THRESHOLD OVERRIDE ==============
+  const [mlThresholdOverride, setMlThresholdOverride] = useState(null); // null = use model default
+  const [customMlThreshold, setCustomMlThreshold] = useState(0.0);
+  const [confidenceThreshold, setConfidenceThreshold] = useState(0.45); // Min confidence for HOME
 
   // ============== TOASTS ==============
   const [toasts, setToasts] = useState([]);
@@ -180,15 +249,15 @@ function Vibrations() {
   const handleSensitivityChange = (newSensitivity) => {
     setSensitivity(newSensitivity);
     if (newSensitivity === 'custom') {
-      // Keep custom threshold
+      // Keep custom threshold - apply to adaptive threshold multiplier
       if (detectorRef.current) {
-        detectorRef.current.updateConfig({ THRESHOLD_MULT: customThreshold });
+        detectorRef.current.updateConfig({ ADAPTIVE_THRESHOLD_MULT: customThreshold });
       }
     } else {
       const preset = SENSITIVITY_PRESETS[newSensitivity];
       if (preset && detectorRef.current) {
         detectorRef.current.updateConfig(preset);
-        setCustomThreshold(preset.THRESHOLD_MULT);
+        setCustomThreshold(preset.ADAPTIVE_THRESHOLD_MULT || 3.2);
       }
     }
     showToast(`🎚️ Sensitivity set to ${newSensitivity}`, 'success');
@@ -200,7 +269,37 @@ function Vibrations() {
       setCustomThreshold(threshold);
       setSensitivity('custom');
       if (detectorRef.current) {
-        detectorRef.current.updateConfig({ THRESHOLD_MULT: threshold });
+        // Update adaptive threshold multiplier
+        detectorRef.current.updateConfig({
+          ADAPTIVE_THRESHOLD_MULT: threshold,
+          // Very low MIN_RMS - any visible signal should pass
+          MIN_RMS_RAW: Math.max(0.003, Math.min(0.04, 0.01 * threshold))
+        });
+      }
+    }
+  };
+
+  // Lower threshold quick action (reduce by 80%)
+  const lowerThresholdEightyPercent = () => {
+    const newVal = Math.max(0.1, customThreshold * 0.2);
+    setCustomThreshold(newVal);
+    setSensitivity('custom');
+    if (detectorRef.current) {
+      detectorRef.current.updateConfig({
+        ADAPTIVE_THRESHOLD_MULT: newVal,
+        MIN_RMS_RAW: Math.max(0.003, Math.min(0.04, 0.01 * newVal))
+      });
+    }
+    showToast(`⬇️ Threshold reduced by 80% → ${newVal.toFixed(2)}x`, 'success');
+  };
+
+  // Raw amplitude gate handler
+  const handleRawGateChange = (value) => {
+    const gate = parseInt(value, 10);
+    if (!isNaN(gate) && gate >= 0 && gate <= 2048) {
+      setRawGate(gate);
+      if (detectorRef.current) {
+        detectorRef.current.updateConfig({ RAW_DELTA_GATE_ADC: gate });
       }
     }
   };
@@ -223,6 +322,66 @@ function Vibrations() {
     }
   }, [showToast]);
 
+  // ============== API: FETCH STATUS ==============
+  const fetchStatus = async () => {
+    try {
+      const result = await api.getStatus();
+      const samplesPerPerson = result.samples_per_person || {};
+      setSampleCounts(samplesPerPerson);
+
+      // Fetch dual dataset status and MLP model status
+      try {
+        const datasetStatus = await api.getDatasetStatus();
+        console.log('[fetchStatus] Dataset status:', datasetStatus);
+        if (datasetStatus.dual_dataset) {
+          setDualDatasetStatus(datasetStatus.dual_dataset);
+        }
+        if (datasetStatus.mlp_model) {
+          console.log('[fetchStatus] MLP status:', datasetStatus.mlp_model);
+          setMlpModelStatus(datasetStatus.mlp_model);
+        }
+
+        // Update available datasets from sample_counts (full names like HOME_Apurv)
+        // This is more reliable than home_csv.persons which only has short names
+        const datasetNames = Object.keys(samplesPerPerson).filter(name =>
+          name.toUpperCase().startsWith('HOME')
+        );
+        console.log('[fetchStatus] Available datasets:', datasetNames);
+
+        if (datasetNames.length > 0) {
+          setAvailableDatasets(datasetNames);
+          // Auto-select all datasets if none selected
+          if (selectedDatasets.length === 0) {
+            setSelectedDatasets(datasetNames);
+          }
+        }
+      } catch (e) {
+        console.log("Dataset status not available (backend may need update)", e);
+      }
+
+      // Fetch available models
+      try {
+        const modelsResult = await api.getAvailableModels();
+        console.log('[fetchStatus] Available models:', modelsResult);
+        if (modelsResult.models) {
+          setAvailableModels(modelsResult.models);
+          setActiveModel(modelsResult.active_model || 'MLPClassifier');
+
+          // Build models status object
+          const statusObj = {};
+          modelsResult.models.forEach(m => {
+            statusObj[m.name] = m;
+          });
+          setModelsStatus(statusObj);
+        }
+      } catch (e) {
+        console.log("Models status not available (backend may need update)", e);
+      }
+    } catch (error) {
+      console.error("Failed to fetch status:", error);
+    }
+  };
+
   // ============== FETCH STATUS ON MOUNT ==============
   useEffect(() => {
     fetchStatus();
@@ -238,17 +397,6 @@ function Vibrations() {
       portRef.current?.close().catch(() => { });
     };
   }, []);
-
-  // ============== API: FETCH STATUS ==============
-  const fetchStatus = async () => {
-    try {
-      const result = await api.getStatus();
-      setSampleCounts(result.samples_per_person || {});
-      setModelTrained(result.model_status === 'Ready');
-    } catch (error) {
-      console.error("Failed to fetch status:", error);
-    }
-  };
 
   // ============== SERIAL: CONNECT ==============
   const connectSerial = async () => {
@@ -273,9 +421,9 @@ function Vibrations() {
       setLifData([]);
       setSpikeMarkers([]);
       setValidatedEvents([]);
-      setDetectionStats({ totalSamples: 0, eventsDetected: 0, eventsRejected: 0, lastRejectionReason: null });
+      setDetectionStats({ totalSamples: 0, eventsDetected: 0, noiseRejected: 0, lastRejectionReason: null });
 
-      const effectiveLabel = labelName.trim() || sampleMode;
+      const effectiveLabel = getEffectiveLabel();
       setStatus(`🟢 Connected — Recording as "${effectiveLabel}"...`);
 
       readLoop(reader);
@@ -322,15 +470,15 @@ function Vibrations() {
   const processSerialLine = (line) => {
     if (!line) return;
 
-    // Parse ESP32 format: "Raw:1958 Baseline:1906 Amplified:382 Peak:382"
-    // Or simple number format
+    // Parse ESP32 formats robustly: "Raw:1958", "Raw: 1958", "raw=1958", or just a number
     let rawValue;
-
-    const rawMatch = line.match(/Raw:(\d+)/);
+    const rawMatch = line.match(/Raw\s*[:=]?\s*(\d{1,4})/i);
     if (rawMatch) {
       rawValue = parseInt(rawMatch[1], 10);
     } else {
-      rawValue = parseInt(line, 10);
+      // Fallback: first integer on the line
+      const anyNum = line.match(/\b(\d{1,4})\b/);
+      rawValue = anyNum ? parseInt(anyNum[1], 10) : NaN;
     }
 
     if (isNaN(rawValue) || rawValue < 0 || rawValue > 4095) return;
@@ -348,16 +496,73 @@ function Vibrations() {
       totalSamples: prev.totalSamples + 1
     }));
 
+    // Store raw samples for manual capture (last 0.5 second = 100 samples)
+    manualBufferRef.current.push(rawValue);
+    if (manualBufferRef.current.length > 100) {
+      manualBufferRef.current.shift();
+    }
+
     // Update amplified signal graph
     setAmplifiedData(prev => {
-      const newData = [...prev, { time: timestamp, value: result.amplified }];
+      const newData = [...prev, { time: timestamp, value: result.filtered }];
       return newData.slice(-500); // Keep last 500 points
     });
+
+    // ============== SAVE ALL VISIBLE MODE ==============
+    // Captures everything that passes noise filter (rawGate ADC & spikeThreshold)
+    if (saveAllVisibleMode && !result.isWarmup) {
+      const rawDelta = Math.abs(rawValue - (detector.baselineMean || 2048));
+      const filteredAbs = Math.abs(result.filtered);
+
+      // If signal passes both filters, add to visible buffer
+      if (rawDelta >= rawGate && filteredAbs >= spikeThreshold) {
+        visibleBufferRef.current.push(rawValue);
+      } else if (visibleBufferRef.current.length > 0) {
+        // Signal dropped - check if we have enough to save
+        const now = Date.now();
+        if (visibleBufferRef.current.length >= 20 && (now - lastVisibleSaveRef.current) > 500) {
+          // Create event from visible buffer
+          const capturedSamples = [...visibleBufferRef.current];
+          const visibleEvent = {
+            raw: capturedSamples,
+            centered: capturedSamples.map(v => v - (detector.baselineMean || 2048)),
+            metrics: {
+              duration_ms: (capturedSamples.length / 200) * 1000,
+              rms: Math.sqrt(capturedSamples.reduce((sum, v) => sum + Math.pow(v - (detector.baselineMean || 2048), 2), 0) / capturedSamples.length),
+              peakDev: Math.max(...capturedSamples.map(v => Math.abs(v - (detector.baselineMean || 2048)))),
+              samples: capturedSamples.length
+            },
+            baselineMean: detector.baselineMean || 2048,
+            noiseFloor: detector.noiseFloor || 0.02,
+            timestamp: now,
+            isNoise: false,
+            visibleCapture: true
+          };
+
+          // Add to validated events
+          setValidatedEvents(prev => {
+            const updated = [...prev, visibleEvent];
+            console.log(`📊 Visible capture! ${capturedSamples.length} samples, Total: ${updated.length}`);
+            return updated;
+          });
+
+          setDetectionStats(prev => ({
+            ...prev,
+            eventsDetected: prev.eventsDetected + 1
+          }));
+
+          lastVisibleSaveRef.current = now;
+          setStatus(`📊 Auto-captured ${capturedSamples.length} samples (visible activity)`);
+        }
+        // Clear buffer for next capture
+        visibleBufferRef.current = [];
+      }
+    }
 
     // Process through LIF neuron
     const lif = lifNeuronRef.current;
     if (lif && !result.isWarmup) {
-      const normalizedInput = Math.abs(result.amplified) / 500; // Normalize
+      const normalizedInput = Math.abs(result.filtered) / 500; // Normalize
       const lifResult = lif.step(normalizedInput);
 
       setLifData(prev => {
@@ -375,7 +580,8 @@ function Vibrations() {
 
     // Update status during warmup
     if (result.isWarmup) {
-      setStatus(`🔄 Warming up... (${detector.warmupCount}/${DETECTION_CONFIG.WARMUP_THRESHOLD})`);
+      const progress = result.warmupProgress ? (result.warmupProgress * 100).toFixed(0) : '...';
+      setStatus(`🔄 Warming up noise floor... ${progress}%`);
       return;
     }
 
@@ -383,25 +589,109 @@ function Vibrations() {
     if (result.eventActive) {
       setCurrentEventInfo({
         length: result.eventLength,
-        deviation: result.deviation,
-        threshold: result.threshold
+        energy: result.energy,
+        threshold: result.threshold,
+        noiseFloor: result.noiseFloor
       });
-      setStatus(`📊 Event active: ${result.eventLength} samples`);
+      setStatus(`📊 Capturing: ${result.eventLength} samples, energy=${result.energy?.toFixed(4) || '?'}`);
     } else {
       setCurrentEventInfo(null);
       if (!result.event) {
-        setStatus(`🟢 Monitoring — Threshold: ${result.threshold.toFixed(1)}`);
+        // Show energy-based status with noise floor
+        const energyRatio = result.energy / Math.max(result.threshold, 0.001);
+        setStatus(`🟢 Noise: ${result.noiseFloor?.toFixed(4) || '?'} | Thresh: ${result.threshold?.toFixed(4) || '?'} | Energy: ${result.energy?.toFixed(4) || '?'} (${(energyRatio * 100).toFixed(0)}%)`);
       }
     }
 
-    // Handle detected event
-    if (result.event) {
-      handleValidatedEvent(result.event);
+    // Handle detected event (could be valid footstep or rejected noise)
+    // Skip if in manual capture mode
+    if (result.event && !manualCaptureMode) {
+      if (result.event.isNoise || result.event.rejected) {
+        // Noise event rejected - do not save, just log
+        setDetectionStats(prev => ({
+          ...prev,
+          noiseRejected: (prev.noiseRejected || 0) + 1
+        }));
+        console.log('❌ Noise rejected:', result.event.reasons);
+        setStatus(`🔇 Noise rejected: ${result.event.reasons?.[0] || 'Invalid pattern'}`);
+      } else {
+        // Valid footstep
+        handleValidatedEvent(result.event);
+      }
     }
+  };
+
+  // ============== MANUAL CAPTURE ==============
+  const handleManualCapture = () => {
+    if (manualBufferRef.current.length < 25) {
+      showToast('⚠ Not enough data - wait a moment', 'warning');
+      return;
+    }
+
+    // Create a simple event from the manual buffer
+    const capturedSamples = [...manualBufferRef.current];
+    const detector = detectorRef.current;
+    const captureTime = Date.now();
+
+    // Calculate the indices for highlighting on the chart
+    // The capture window is the last 100 samples (0.5 second at 200Hz)
+    const currentDataLength = amplifiedData.length;
+    const capturedLength = capturedSamples.length;
+    const startIdx = Math.max(0, currentDataLength - capturedLength);
+    const endIdx = currentDataLength;
+
+    // Set capture highlight for visualization
+    setCaptureHighlight({
+      startIdx,
+      endIdx,
+      timestamp: captureTime,
+      samples: capturedLength
+    });
+
+    // Clear highlight after 3 seconds
+    setTimeout(() => {
+      setCaptureHighlight(null);
+    }, 3000);
+
+    const manualEvent = {
+      raw: capturedSamples,
+      centered: capturedSamples.map(v => v - (detector?.baselineMean || 2048)),
+      metrics: {
+        duration_ms: (capturedSamples.length / 200) * 1000,
+        rms: 0,
+        peakDev: Math.max(...capturedSamples.map(v => Math.abs(v - (detector?.baselineMean || 2048)))),
+        samples: capturedSamples.length
+      },
+      baselineMean: detector?.baselineMean || 2048,
+      noiseFloor: detector?.noiseFloor || 0.02,
+      timestamp: captureTime,
+      isNoise: false,
+      manualCapture: true
+    };
+
+    // Add to validated events
+    setValidatedEvents(prev => {
+      const updated = [...prev, manualEvent];
+      console.log(`📸 Manual capture! Total collected: ${updated.length}, Samples: ${capturedLength}`);
+      showToast(`📸 Captured ${capturedSamples.length} samples (${(capturedLength / 200 * 1000).toFixed(0)}ms)!`, 'success');
+      return updated;
+    });
+
+    // Update stats
+    setDetectionStats(prev => ({
+      ...prev,
+      eventsDetected: prev.eventsDetected + 1
+    }));
   };
 
   // ============== HANDLE VALIDATED EVENT ==============
   const handleValidatedEvent = async (event) => {
+    // CRITICAL: Block noise from being saved as training data
+    if (event.isNoise || event.rejected) {
+      console.log('⛔ Blocked noise event from being processed');
+      return;
+    }
+
     // Update FFT display
     setFftData({
       frequencies: event.frequencies.slice(0, 50),
@@ -409,7 +699,11 @@ function Vibrations() {
     });
 
     // Add to validated events
-    setValidatedEvents(prev => [...prev.slice(-9), event]);
+    setValidatedEvents(prev => {
+      const updated = [...prev, event]; // Keep all events, not just last 9
+      console.log(`✅ Event added! Total collected: ${updated.length}`);
+      return updated;
+    });
 
     // Update stats
     setDetectionStats(prev => ({
@@ -417,73 +711,85 @@ function Vibrations() {
       eventsDetected: prev.eventsDetected + 1
     }));
 
-    // Show toast
+    // Show toast with footstep metrics
     const metrics = event.metrics;
     showToast(
-      `✅ Footstep detected! SNR: ${metrics.snr.toFixed(1)}, Freq: ${metrics.domFreq.toFixed(0)}Hz`,
+      `✅ Footstep! Duration: ${metrics.duration_ms?.toFixed(0) || '?'}ms, RMS: ${metrics.rms?.toFixed(3) || '?'}`,
       'success'
     );
 
-    setStatus(`✅ Event validated! Dom.Freq: ${metrics.domFreq.toFixed(1)}Hz, SNR: ${metrics.snr.toFixed(2)}`);
+    setStatus(`✅ Valid footstep! ${metrics.duration_ms?.toFixed(0)}ms, Peak: ${metrics.peakDev?.toFixed(0)}, Band: ${(metrics.bandRatio * 100)?.toFixed(0)}%`);
 
-    // Auto-save if enabled
-    if (autoSaveEnabled && personName.trim()) {
-      await saveEventToBackend(event);
+    // Live predict with MLP if enabled and model trained
+    if (livePredictEnabled && mlpModelStatus.trained && !isPredicting) {
+      console.log('🔮 Triggering live MLP prediction...');
+      await predictEventMLP(event);
     }
 
-    // Live predict if enabled and model trained
-    if (livePredictEnabled && modelTrained) {
-      await predictEvent(event);
-    }
-  };
+    // AUTO-SAVE LOGIC
+    if (autoSaveEnabled) {
+      const effectiveLabel = getEffectiveLabel();
+      const backendData = FootstepEventDetector.toBackendFormat(event);
 
-  // ============== SAVE EVENT TO BACKEND ==============
-  // Get the effective label (custom name or mode)
-  const getEffectiveLabel = () => labelName.trim() || sampleMode;
-
-  const saveEventToBackend = async (event) => {
-    // Throttle: max 2 saves per second
-    const now = Date.now();
-    if (now - lastSaveTimeRef.current < 500) return;
-    lastSaveTimeRef.current = now;
-
-    const backendData = FootstepEventDetector.toBackendFormat(event);
-    if (!backendData) return;
-
-    const effectiveLabel = getEffectiveLabel();
-
-    try {
-      const result = await api.saveTrainData(backendData, effectiveLabel);
-      if (result.samples_per_person) {
-        setSampleCounts(result.samples_per_person);
+      if (backendData) {
+        try {
+          await api.saveTrainData(backendData, effectiveLabel);
+          showToast(`💾 Auto-saved as "${effectiveLabel}"`, 'success');
+          // Update status to reflect save
+          await fetchStatus();
+        } catch (error) {
+          console.error("Auto-save failed:", error);
+          showToast(`❌ Auto-save failed: ${error.message}`, 'error');
+        }
       }
-      showToast(`💾 Auto-saved to ${effectiveLabel}`, 'success');
-    } catch (error) {
-      console.error("Auto-save failed:", error);
     }
   };
 
-  // ============== PREDICT EVENT ==============
-  const predictEvent = async (event) => {
+  // ============== GET EFFECTIVE LABEL ==============
+  const getEffectiveLabel = () => {
+    const customName = labelName.trim();
+    if (customName) {
+      // Always use HOME prefix - INTRUDER is detected by MLP, not stored
+      return `HOME_${customName}`;
+    }
+    return 'HOME';
+  };
+
+  // ============== PREDICT EVENT WITH MLP (Live Prediction) ==============
+  const predictEventMLP = async (event) => {
     const backendData = FootstepEventDetector.toBackendFormat(event);
-    if (!backendData) return;
+    if (!backendData) {
+      console.log('⚠️ Cannot format event for prediction');
+      return;
+    }
+
+    // Set predicting state for live predictions
+    setIsPredicting(true);
+    console.log('🔮 Live MLP predicting event...');
 
     try {
-      const result = await api.predict(backendData);
-      const formatted = formatPrediction(result);
+      const result = await api.predictMLP(backendData);
 
+      const formatted = formatPrediction(result);
+      console.log('🔮 MLP Prediction result:', result);
       setPrediction({ ...result, formatted });
 
       if (result.is_intruder) {
         alarmRef.current?.play();
-        showToast(`🚨 INTRUDER: ${formatted.person} (${formatted.confidenceDisplay})`, 'error');
-      } else if (result.confidence < 0.5) {
-        showToast(`⚠ Low confidence: ${formatted.person} (${formatted.confidenceDisplay})`, 'warning');
+        showToast(`🚨 ${result.prediction}`, 'error');
+        setStatus(`🚨 ${result.alert}`);
+      } else if (result.color_code === 'yellow') {
+        showToast(`⚠ ${result.prediction}`, 'warning');
+        setStatus(`⚠ ${result.alert}`);
       } else {
-        showToast(`✅ ${formatted.person}: ${formatted.confidenceDisplay}`, 'success');
+        showToast(`✅ ${result.prediction} (${(result.confidence * 100).toFixed(1)}%)`, 'success');
+        setStatus(`✅ ${result.alert}`);
       }
     } catch (error) {
-      console.error("Prediction failed:", error);
+      console.error("MLP Live prediction failed:", error);
+      showToast(`⚠️ Prediction error: ${error.message}`, 'warning');
+    } finally {
+      setIsPredicting(false);
     }
   };
 
@@ -493,25 +799,73 @@ function Vibrations() {
       return showToast("⚠ No validated events to save.", "warning");
     }
 
+    // Require person name for saving
+    if (!labelName.trim()) {
+      return showToast("⚠ Please enter a person name before saving!", "warning");
+    }
+
     const effectiveLabel = getEffectiveLabel();
     setIsSaving(true);
-    setStatus(`⬆ Uploading samples as "${effectiveLabel}"...`);
+    setStatus(`⬆ Uploading ${validatedEvents.length} samples as "${effectiveLabel}"...`);
 
     try {
-      let savedCount = 0;
+      let frontendConverted = 0;
+      let frontendRejected = 0;
+      let backendSaved = 0;
+      let backendRejected = 0;
+
       for (const event of validatedEvents) {
         const backendData = FootstepEventDetector.toBackendFormat(event);
-        if (backendData) {
-          await api.saveTrainData(backendData, effectiveLabel);
-          savedCount++;
+
+        if (!backendData) {
+          frontendRejected++;
+          console.log(`⛔ Frontend rejected event:`, {
+            hasRaw: !!event.raw,
+            isNoise: event.isNoise,
+            rejected: event.rejected,
+            rawLength: event.raw?.length
+          });
+          continue;
+        }
+
+        frontendConverted++;
+
+        // Send to backend and check actual save result
+        const result = await api.saveTrainData(backendData, effectiveLabel);
+
+        if (result.valid_samples > 0) {
+          backendSaved++;
+        } else {
+          backendRejected++;
+          console.log(`⛔ Backend rejected sample (amplitude gate):`, {
+            dataLength: backendData.length,
+            max: Math.max(...backendData),
+            min: Math.min(...backendData),
+            range: Math.max(...backendData) - Math.min(...backendData)
+          });
         }
       }
 
       await fetchStatus();
       setValidatedEvents([]);
 
-      showToast(`✅ Saved ${savedCount} samples as "${effectiveLabel}"!`, 'success');
-      setStatus(`✅ Saved ${savedCount} samples as "${effectiveLabel}"`);
+      // Detailed save summary
+      const totalEvents = validatedEvents.length;
+      const totalRejected = frontendRejected + backendRejected;
+
+      if (totalRejected > 0) {
+        console.log(`📊 Save Summary: ${backendSaved}/${totalEvents} saved`);
+        console.log(`   Frontend rejected: ${frontendRejected} (noise/invalid)`);
+        console.log(`   Backend rejected: ${backendRejected} (low amplitude)`);
+        showToast(
+          `⚠️ Saved ${backendSaved}/${totalEvents} samples. ${totalRejected} rejected (${frontendRejected} noise, ${backendRejected} low amplitude)`,
+          backendSaved > 0 ? 'warning' : 'error'
+        );
+      } else {
+        showToast(`✅ Saved ${backendSaved} samples as "${effectiveLabel}"!`, 'success');
+      }
+
+      setStatus(`✅ Saved ${backendSaved}/${totalEvents} samples as "${effectiveLabel}"`);
     } catch (error) {
       showToast(`❌ Save failed: ${error.message}`, 'error');
       setStatus(`❌ Save failed: ${error.message}`);
@@ -520,42 +874,118 @@ function Vibrations() {
     }
   };
 
-  // ============== TRAIN MODEL ==============
+  // ============== TRAIN SELECTED MODEL ==============
   const handleTrainModel = async () => {
+    if (selectedDatasets.length === 0) {
+      showToast('⚠️ Please select at least one dataset to train on', 'warning');
+      return;
+    }
+
+    const modelInfo = availableModels.find(m => m.name === selectedModel);
+    const modelDisplayName = modelInfo?.short_name || selectedModel;
+
     setIsTraining(true);
-    setStatus("🧠 Training anomaly detector on HOME patterns...");
+    setStatus(`🧠 Training ${modelDisplayName} on ${selectedDatasets.length} dataset(s)...`);
+    setTrainingDetails(null);
+    setShowTrainingDetails(false);
 
     try {
-      const result = await api.trainModel(sampleMode);
-      setModelTrained(true);
+      // Use the multi-model training endpoint
+      const result = await api.trainSelectedModel(selectedModel, selectedDatasets);
 
-      if (result.metrics) {
+      if (result.success) {
+        const accuracy = result.metrics?.training_accuracy ?? 0;
+        const cvAccuracy = result.metrics?.cv_accuracy ?? null;
+        const cvStd = result.metrics?.cv_std ?? null;
+        const cvScores = result.metrics?.cv_scores ?? [];
+        const nFolds = result.metrics?.n_folds ?? 5;
+
         setTrainingMetrics(result.metrics);
-        const accuracy = (result.metrics.accuracy * 100).toFixed(1);
-        showToast(`🎯 Anomaly detector trained! Accuracy: ${accuracy}%`, 'success');
-        setStatus(`🎯 Anomaly detector ready! Accuracy: ${accuracy}%`);
+
+        // Update model status based on which model was trained
+        if (selectedModel === 'MLPClassifier') {
+          setMlpModelStatus({ trained: true, accuracy: cvAccuracy || accuracy });
+        }
+
+        if (result.dual_dataset) {
+          setDualDatasetStatus(result.dual_dataset);
+        }
+
+        // Store detailed training results
+        setTrainingDetails({
+          modelName: selectedModel,
+          modelDisplayName,
+          accuracy,
+          cvAccuracy,
+          cvStd,
+          cvScores,
+          nFolds,
+          homeSamples: result.metrics?.home_samples || 0,
+          intruderSamples: result.metrics?.intruder_samples || 0,
+          totalSamples: result.metrics?.total_samples || 0,
+          datasets: result.dataset_details?.datasets || [],
+          datasetNames: result.dataset_details?.dataset_names || [],
+          selectedDatasets: result.dataset_details?.selected_datasets || selectedDatasets,
+          topFeatures: result.top_features || []
+        });
+
+        // Auto-show training details panel
+        setShowTrainingDetails(true);
+
+        // Show CV results if available
+        const cvInfo = cvAccuracy !== null ? ` (CV: ${cvAccuracy}% ± ${cvStd}%)` : '';
+        showToast(`🎯 ${modelDisplayName} trained! Accuracy: ${accuracy}%${cvInfo}`, 'success');
+        setStatus(`🎯 ${modelDisplayName} ready! Accuracy: ${accuracy}%${cvInfo}`);
       } else {
-        showToast('🎯 Anomaly detector trained successfully!', 'success');
-        setStatus("🎯 Anomaly detector trained on HOME patterns!");
+        throw new Error(result.error || 'Training failed');
       }
 
       await fetchStatus();
     } catch (error) {
-      showToast(`❌ Training failed: ${error.message}`, 'error');
-      setStatus(`❌ Training failed: ${error.message}`);
+      showToast(`❌ ${modelDisplayName} Training failed: ${error.message}`, 'error');
+      setStatus(`❌ ${modelDisplayName} Training failed: ${error.message}`);
     } finally {
       setIsTraining(false);
     }
   };
 
-  // ============== MANUAL PREDICT ==============
-  const handlePredict = async () => {
+  // Legacy alias for MLP training (backward compatibility)
+  const handleTrainMLP = handleTrainModel;
+
+  // ============== SET ACTIVE MODEL ==============
+  const handleSetActiveModel = async (modelName) => {
+    const modelInfo = availableModels.find(m => m.name === modelName);
+    if (!modelInfo?.trained) {
+      showToast(`⚠️ ${modelInfo?.short_name || modelName} is not trained yet. Train it first!`, 'warning');
+      return;
+    }
+
+    try {
+      const result = await api.setActiveModel(modelName);
+      if (result.success) {
+        setActiveModel(modelName);
+        showToast(`✅ Switched to ${modelInfo?.short_name || modelName} for predictions`, 'success');
+        await fetchStatus();
+      }
+    } catch (error) {
+      showToast(`❌ Failed to switch model: ${error.message}`, 'error');
+    }
+  };
+
+  // ============== PREDICT WITH SELECTED MODEL ==============
+  const handlePredictWithModel = async () => {
     if (validatedEvents.length === 0) {
       return showToast("⚠ No footstep events to predict.", "warning");
     }
 
+    const modelInfo = modelsStatus[activeModel];
+    if (!modelInfo?.trained) {
+      return showToast(`⚠ ${activeModel} not trained. Train first!`, "warning");
+    }
+
     setIsPredicting(true);
-    setStatus("🔍 Predicting identity...");
+    const modelName = modelInfo?.short_name || activeModel;
+    setStatus(`🔮 Predicting with ${modelName}...`);
 
     const lastEvent = validatedEvents[validatedEvents.length - 1];
     const backendData = FootstepEventDetector.toBackendFormat(lastEvent);
@@ -567,25 +997,71 @@ function Vibrations() {
     }
 
     try {
-      const result = await api.predict(backendData);
-      const formatted = formatPrediction(result);
+      const result = await api.predictWithModel(backendData, activeModel);
 
+      const formatted = formatPrediction(result);
+      setPrediction({ ...result, formatted, model_used: activeModel });
+
+      if (result.is_intruder) {
+        alarmRef.current?.play();
+        showToast(`🚨 ${result.prediction} (${modelName})`, 'error');
+        setStatus(`🚨 ${result.alert} [${modelName}]`);
+      } else if (result.color_code === 'yellow') {
+        showToast(`⚠ ${result.prediction} (${modelName})`, 'warning');
+        setStatus(`⚠ ${result.alert} [${modelName}]`);
+      } else {
+        showToast(`✅ ${result.prediction} (${modelName})`, 'success');
+        setStatus(`✅ ${result.alert} [${modelName}]`);
+      }
+    } catch (error) {
+      showToast(`❌ Prediction failed: ${error.message}`, 'error');
+      setStatus(`❌ Prediction failed: ${error.message}`);
+    } finally {
+      setIsPredicting(false);
+    }
+  };
+
+  // ============== PREDICT WITH MLP (Manual button) ==============
+  const handlePredictMLP = async () => {
+    if (validatedEvents.length === 0) {
+      return showToast("⚠ No footstep events to predict.", "warning");
+    }
+
+    if (!mlpModelStatus.trained) {
+      return showToast("⚠ MLP not trained. Train first!", "warning");
+    }
+
+    setIsPredicting(true);
+    setStatus("🔮 Predicting with MLP + Rules...");
+
+    const lastEvent = validatedEvents[validatedEvents.length - 1];
+    const backendData = FootstepEventDetector.toBackendFormat(lastEvent);
+
+    if (!backendData) {
+      showToast("⚠ Invalid event data", "warning");
+      setIsPredicting(false);
+      return;
+    }
+
+    try {
+      const result = await api.predictMLP(backendData);
+
+      const formatted = formatPrediction(result);
       setPrediction({ ...result, formatted });
 
       if (result.is_intruder) {
         alarmRef.current?.play();
-        showToast(`🚨 INTRUDER ALERT! Confidence: ${formatted.confidenceDisplay}`, 'error');
-        setStatus(`🚨 INTRUDER DETECTED!`);
-      } else if (result.confidence < 0.5) {
-        alarmRef.current?.play();
-        showToast(`⚠ Low Confidence: ${formatted.person}`, 'warning');
-        setStatus(`⚠ LOW CONFIDENCE: ${formatted.person} (${formatted.confidenceDisplay})`);
+        showToast(`🚨 ${result.prediction}`, 'error');
+        setStatus(`🚨 ${result.alert}`);
+      } else if (result.color_code === 'yellow') {
+        showToast(`⚠ ${result.prediction}`, 'warning');
+        setStatus(`⚠ ${result.alert}`);
       } else {
-        showToast(`✅ Family: ${formatted.person} (${formatted.confidenceDisplay})`, 'success');
-        setStatus(`✅ IDENTIFIED: ${formatted.person} - ${formatted.confidenceDisplay}`);
+        showToast(`✅ ${result.prediction} (${(result.confidence * 100).toFixed(1)}%)`, 'success');
+        setStatus(`✅ ${result.alert}`);
       }
     } catch (error) {
-      showToast('❌ Prediction failed!', 'error');
+      showToast(`❌ MLP Prediction failed: ${error.message}`, 'error');
       setStatus(`❌ Prediction failed: ${error.message}`);
     } finally {
       setIsPredicting(false);
@@ -603,7 +1079,7 @@ function Vibrations() {
       const result = await api.resetModel();
 
       setSampleCounts({});
-      setModelTrained(false);
+      setMlpModelStatus({ trained: false, accuracy: 0 });
       setTrainingMetrics(null);
       setPrediction(null);
       setDatasetInfo(null);
@@ -722,9 +1198,9 @@ function Vibrations() {
   };
 
   // ============== CHART DATA ==============
-  const amplifiedChartData = {
-    labels: amplifiedData.map(d => d.time.toFixed(2)),
-    datasets: [{
+  // Build datasets array - base datasets first
+  const chartDatasets = [
+    {
       label: "Amplified Signal",
       data: amplifiedData.map(d => d.value),
       borderColor: "#00eaff",
@@ -733,7 +1209,42 @@ function Vibrations() {
       pointRadius: 0,
       fill: true,
       tension: 0.1
-    }]
+    },
+    {
+      label: "Captured Event",
+      data: amplifiedData.map(d => d.isEvent ? d.value : null),
+      borderColor: "#ff0055",
+      backgroundColor: "rgba(255, 0, 85, 0.3)",
+      borderWidth: 2,
+      pointRadius: 0,
+      fill: true,
+      tension: 0.1
+    }
+  ];
+
+  // Add manual capture highlight if active
+  if (captureHighlight) {
+    chartDatasets.push({
+      label: `📸 Captured (${captureHighlight.samples} samples)`,
+      data: amplifiedData.map((d, idx) => {
+        if (idx >= captureHighlight.startIdx && idx < captureHighlight.endIdx) {
+          return d.value;
+        }
+        return null;
+      }),
+      borderColor: "#fbbf24",
+      backgroundColor: "rgba(251, 191, 36, 0.4)",
+      borderWidth: 3,
+      pointRadius: 0,
+      fill: true,
+      tension: 0.1,
+      order: -1
+    });
+  }
+
+  const amplifiedChartData = {
+    labels: amplifiedData.map(d => d.time.toFixed(2)),
+    datasets: chartDatasets
   };
 
   const fftChartData = {
@@ -786,45 +1297,70 @@ function Vibrations() {
         </div>
       </div>
 
-      {/* ONE-CLASS ANOMALY DETECTION INFO */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-        <div className="bg-gradient-to-r from-green-600/20 to-emerald-600/20 p-4 rounded-xl border border-green-500/30">
-          <label className="block text-sm text-green-400 mb-2 font-semibold">🧠 One-Class Anomaly Detection</label>
-          <div className="flex items-center gap-2 mb-2">
-            <CheckCircle className="w-5 text-green-400" />
-            <span className="text-lg font-bold text-green-300">Training Mode: HOME</span>
-          </div>
-          <p className="text-xs text-gray-400">
-            Train on HOME footsteps only. Model learns "normal" patterns and automatically detects unknown intruders as anomalies.
-          </p>
-        </div>
-
-        <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700">
-          <label className="block text-sm text-gray-400 mb-2">Person Name (Optional):</label>
-          <div className="flex gap-2">
+      {/* SAVE LABEL SELECTOR + SETTINGS */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+        {/* PERSON NAME INPUT - Required, always saves as HOME_name */}
+        <div className={`bg-gray-800/50 p-4 rounded-xl border ${labelName.trim() ? 'border-green-600' : 'border-yellow-600'}`}>
+          <label className="block text-sm text-gray-400 mb-2 font-semibold">
+            👤 Person Name for Dataset: <span className="text-red-400">*</span>
+          </label>
+          <div className="flex gap-2 mb-2">
             <input
               type="text"
               value={labelName}
               onChange={(e) => setLabelName(e.target.value)}
-              placeholder="e.g., Pranshul, Aditi, Samir..."
-              className="flex-1 text-white bg-gray-700 p-3 rounded-lg border border-gray-600 focus:border-cyan-500 focus:outline-none"
-              onKeyPress={(e) => e.key === 'Enter' && showToast(`✅ Label set to: ${labelName || 'HOME'}`, 'success')}
+              placeholder="Enter name (required)..."
+              className={`flex-1 text-white bg-gray-700 p-3 rounded-lg border focus:outline-none ${labelName.trim() ? 'border-green-600 focus:border-green-500' : 'border-yellow-600 focus:border-yellow-500'
+                }`}
+              onKeyPress={(e) => e.key === 'Enter' && labelName.trim() && showToast(`✅ Label: ${getEffectiveLabel()}`, 'success')}
             />
             <button
-              onClick={() => showToast(`✅ Label set to: ${labelName || 'HOME'}`, 'success')}
+              onClick={() => labelName.trim() ? showToast(`✅ Label: ${getEffectiveLabel()}`, 'success') : showToast('⚠️ Enter a name first!', 'warning')}
               className="px-4 py-2 bg-cyan-600 hover:bg-cyan-700 rounded-lg font-bold transition-all"
             >
               Set
             </button>
           </div>
-          <p className="text-xs text-gray-500 mt-2">
-            Saving as: <strong className="text-cyan-400 text-base">{labelName || 'HOME'}</strong>
+          <p className="text-xs text-gray-500">
+            {labelName.trim()
+              ? <>Saving as: <strong className="text-base text-green-400">{getEffectiveLabel()}</strong></>
+              : <span className="text-yellow-400">⚠️ Name required to save samples</span>
+            }
+            <span className="ml-2 text-gray-600">• INTRUDER is detected by MLP, not stored</span>
           </p>
         </div>
 
         <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700">
-          <label className="block text-sm text-gray-400 mb-2">Auto Modes:</label>
+          <label className="block text-sm text-gray-400 mb-2">Capture Mode:</label>
           <div className="flex flex-col gap-2">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={manualCaptureMode}
+                onChange={(e) => {
+                  setManualCaptureMode(e.target.checked);
+                  if (e.target.checked) setSaveAllVisibleMode(false);
+                }}
+                className="w-5 h-5 rounded bg-gray-700 border-gray-600"
+              />
+              <span className="text-sm font-semibold">📸 Manual Capture Mode</span>
+            </label>
+
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={saveAllVisibleMode}
+                onChange={(e) => {
+                  setSaveAllVisibleMode(e.target.checked);
+                  if (e.target.checked) setManualCaptureMode(false);
+                  visibleBufferRef.current = [];
+                  showToast(e.target.checked ? '📊 Capturing all visible activity!' : '📊 Visible capture OFF', 'success');
+                }}
+                className="w-5 h-5 rounded bg-gray-700 border-gray-600"
+              />
+              <span className={`text-sm font-semibold ${saveAllVisibleMode ? 'text-cyan-400' : ''}`}>📊 Save All Visible (No Detection)</span>
+            </label>
+
             <label className="flex items-center gap-2 cursor-pointer">
               <input
                 type="checkbox"
@@ -832,19 +1368,34 @@ function Vibrations() {
                 onChange={(e) => setAutoSaveEnabled(e.target.checked)}
                 className="w-5 h-5 rounded bg-gray-700 border-gray-600"
               />
-              <span className="text-sm">Auto-Save Events</span>
-            </label>
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={livePredictEnabled}
-                onChange={(e) => setLivePredictEnabled(e.target.checked)}
-                className="w-5 h-5 rounded bg-gray-700 border-gray-600"
-                disabled={!modelTrained}
-              />
-              <span className={`text-sm ${!modelTrained ? 'text-gray-500' : ''}`}>Live Predict</span>
+              <span className="text-sm font-semibold text-green-400">💾 Auto Save Events</span>
             </label>
           </div>
+
+          {/* Spike Threshold Slider for Save All Visible */}
+          {saveAllVisibleMode && (
+            <div className="mt-3 pt-3 border-t border-gray-600">
+              <label className="block text-xs text-cyan-400 mb-1">Spike Threshold: {spikeThreshold.toFixed(1)}</label>
+              <input
+                type="range"
+                min="0.1"
+                max="2.0"
+                step="0.1"
+                value={spikeThreshold}
+                onChange={(e) => setSpikeThreshold(parseFloat(e.target.value))}
+                className="w-full accent-cyan-500"
+              />
+              <div className="text-xs text-gray-500 mt-1">ADC Gate: {rawGate} | Spike: ≥{spikeThreshold}</div>
+            </div>
+          )}
+
+          <p className="text-xs text-gray-500 mt-2">
+            {saveAllVisibleMode
+              ? `📊 Auto-capturing everything ≥${rawGate} ADC & ≥${spikeThreshold} filtered`
+              : manualCaptureMode
+                ? '📸 Click "Capture Now" when you see activity on the graph'
+                : '🤖 Automatic threshold detection enabled'}
+          </p>
         </div>
       </div>
 
@@ -856,8 +1407,8 @@ function Vibrations() {
             <span className="font-semibold">Training Data (One-Class Anomaly Detection)</span>
           </div>
           <div className="flex items-center gap-2">
-            <span className={`px-2 py-1 rounded text-xs ${modelTrained ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
-              {modelTrained ? '✓ Model Ready' : '⚠ Not Trained'}
+            <span className={`px-2 py-1 rounded text-xs ${mlpModelStatus.trained ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+              {mlpModelStatus.trained ? `✓ MLP Ready (${mlpModelStatus.accuracy}%)` : '⚠ Not Trained'}
             </span>
             <button onClick={fetchStatus} className="p-2 hover:bg-gray-700 rounded-lg transition">
               <RefreshCw className="w-4" />
@@ -897,7 +1448,21 @@ function Vibrations() {
             </span>
           </div>
         </div>
-      </div>      {/* CONTROL BUTTONS */}
+      </div>      {/* MANUAL SAVE INFO */}
+      {validatedEvents.length > 0 && (
+        <div className="bg-gradient-to-r from-blue-900/50 to-cyan-900/50 p-4 rounded-xl border border-blue-700 mb-4">
+          <div className="flex items-center gap-3">
+            <Database className="w-6 text-cyan-400" />
+            <div className="flex-1">
+              <div className="font-bold text-lg">{validatedEvents.length} events collected</div>
+              <div className="text-sm text-gray-300">Click "💾 Save Events" to store them as "{getEffectiveLabel()}"</div>
+            </div>
+            <div className="text-3xl font-bold text-cyan-400">{validatedEvents.length}</div>
+          </div>
+        </div>
+      )}
+
+      {/* CONTROL BUTTONS */}
       <div className="flex flex-wrap gap-3 mb-6">
         <button
           onClick={isConnected ? disconnectSerial : connectSerial}
@@ -910,33 +1475,173 @@ function Vibrations() {
           {isConnected ? "Disconnect" : "Connect Serial"}
         </button>
 
+        {manualCaptureMode && isConnected && (
+          <button
+            onClick={handleManualCapture}
+            className="bg-gradient-to-r from-purple-500 to-pink-500 px-6 py-3 rounded-xl flex gap-2 items-center font-bold hover:from-purple-600 hover:to-pink-600 transition-all shadow-lg shadow-purple-500/30 animate-pulse"
+          >
+            <Eye className="w-5" />
+            📸 Capture Now
+          </button>
+        )}
+
+        {/* Capture Highlight Indicator */}
+        {captureHighlight && (
+          <div className="bg-yellow-500/20 border border-yellow-500 px-4 py-3 rounded-xl flex gap-2 items-center font-medium text-yellow-300 animate-pulse">
+            <span className="text-lg">📸</span>
+            <span>Captured {captureHighlight.samples} samples ({(captureHighlight.samples / 200 * 1000).toFixed(0)}ms) - shown in yellow on graph</span>
+          </div>
+        )}
+
         <button
           onClick={handleSaveTrainData}
           disabled={isSaving || validatedEvents.length === 0}
-          className="bg-gradient-to-r from-green-500 to-emerald-500 px-5 py-3 rounded-xl flex gap-2 items-center font-semibold disabled:opacity-50 disabled:cursor-not-allowed hover:from-green-600 hover:to-emerald-600 transition-all shadow-lg shadow-green-500/20"
+          className="bg-gradient-to-r from-green-500 to-emerald-500 px-6 py-3 rounded-xl flex gap-2 items-center font-bold disabled:opacity-50 disabled:cursor-not-allowed hover:from-green-600 hover:to-emerald-600 transition-all shadow-lg shadow-green-500/30"
         >
           {isSaving ? <RefreshCw className="animate-spin w-5" /> : <Database className="w-5" />}
-          Save ({validatedEvents.length})
+          💾 Save Events ({validatedEvents.length})
         </button>
 
         <button
-          onClick={handleTrainModel}
-          disabled={isTraining}
-          className="bg-gradient-to-r from-yellow-500 to-orange-500 px-5 py-3 rounded-xl flex gap-2 items-center font-semibold disabled:opacity-50 disabled:cursor-not-allowed hover:from-yellow-600 hover:to-orange-600 transition-all shadow-lg shadow-yellow-500/20"
+          onClick={() => {
+            setValidatedEvents([]);
+            showToast('🗑️ Cleared all collected events', 'info');
+          }}
+          disabled={validatedEvents.length === 0}
+          className="bg-gray-700 hover:bg-gray-600 px-4 py-3 rounded-xl flex gap-2 items-center font-semibold disabled:opacity-50 disabled:cursor-not-allowed transition-all"
         >
-          {isTraining ? <RefreshCw className="animate-spin w-5" /> : <BrainCircuit className="w-5" />}
-          Train Model
+          <Trash2 className="w-5" />
+          Clear
         </button>
 
-        <button
-          onClick={handlePredict}
-          disabled={isPredicting || validatedEvents.length === 0 || !modelTrained}
-          className="bg-gradient-to-r from-purple-500 to-pink-500 px-5 py-3 rounded-xl flex gap-2 items-center font-semibold disabled:opacity-50 disabled:cursor-not-allowed hover:from-purple-600 hover:to-pink-600 transition-all shadow-lg shadow-purple-500/20"
-        >
-          {isPredicting ? <RefreshCw className="animate-spin w-5" /> : <Play className="w-5" />}
-          Predict
-        </button>
+        {/* Predict with MLP (Manual) - keep here for quick access */}
+        {mlpModelStatus.trained && (
+          <button
+            onClick={handlePredictMLP}
+            disabled={isPredicting || validatedEvents.length === 0}
+            className="bg-gradient-to-r from-cyan-500 to-blue-500 px-5 py-3 rounded-xl flex gap-2 items-center font-semibold disabled:opacity-50 disabled:cursor-not-allowed hover:from-cyan-600 hover:to-blue-600 transition-all shadow-lg shadow-cyan-500/20"
+          >
+            {isPredicting ? <RefreshCw className="animate-spin w-5" /> : <Zap className="w-5" />}
+            🔮 Predict
+          </button>
+        )}
       </div>
+
+      {/* DUAL DATASET STATUS PANEL (NEW) */}
+      <div className="bg-gradient-to-r from-indigo-900/50 to-purple-900/50 p-4 rounded-xl border border-indigo-700 mb-6">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Database className="w-5 text-indigo-400" />
+            <span className="font-semibold">📊 Dual Dataset Status (150 Samples Target)</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className={`px-2 py-1 rounded text-xs ${mlpModelStatus.trained ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+              MLP: {mlpModelStatus.trained ? `✓ ${mlpModelStatus.accuracy}%` : '⚠ Not Trained'}
+            </span>
+            <button onClick={fetchStatus} className="p-2 hover:bg-gray-700 rounded-lg transition">
+              <RefreshCw className="w-4" />
+            </button>
+          </div>
+        </div>
+
+        {/* Progress Bar */}
+        <div className="mb-3">
+          <div className="flex justify-between text-sm mb-1">
+            <span className="text-gray-400">Progress: {dualDatasetStatus.home_csv?.samples || 0} / {dualDatasetStatus.target_samples}</span>
+            <span className={`font-bold ${dualDatasetStatus.progress_percent >= 100 ? 'text-green-400' : 'text-indigo-400'}`}>
+              {dualDatasetStatus.progress_percent}%
+            </span>
+          </div>
+          <div className="w-full bg-gray-700 rounded-full h-3">
+            <div
+              className={`h-3 rounded-full transition-all duration-500 ${dualDatasetStatus.progress_percent >= 100 ? 'bg-green-500' : 'bg-gradient-to-r from-indigo-500 to-purple-500'}`}
+              style={{ width: `${Math.min(100, dualDatasetStatus.progress_percent)}%` }}
+            />
+          </div>
+        </div>
+
+        {/* Dataset Grid */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <div className="p-3 rounded-lg bg-green-600/20 border border-green-500/30">
+            <div className="text-xs text-green-400 mb-1">HOME.csv</div>
+            <div className="text-xl font-bold">{dualDatasetStatus.home_csv?.samples || 0}</div>
+            <div className="text-xs text-gray-400">samples</div>
+          </div>
+          <div className="p-3 rounded-lg bg-blue-600/20 border border-blue-500/30">
+            <div className="text-xs text-blue-400 mb-1">Persons</div>
+            <div className="text-xl font-bold">{dualDatasetStatus.home_csv?.persons?.length || 0}</div>
+            <div className="text-xs text-gray-400">{(dualDatasetStatus.home_csv?.persons || []).join(', ') || 'None'}</div>
+          </div>
+          <div className="p-3 rounded-lg bg-purple-600/20 border border-purple-500/30">
+            <div className="text-xs text-purple-400 mb-1">MLP Status</div>
+            <div className={`text-lg font-bold ${mlpModelStatus.trained ? 'text-green-400' : 'text-yellow-400'}`}>
+              {mlpModelStatus.trained ? '✅ Ready' : '⏳ Train'}
+            </div>
+            <div className="text-xs text-gray-400">{mlpModelStatus.accuracy ? `${mlpModelStatus.accuracy}% acc` : 'Need 5+ samples'}</div>
+          </div>
+          <div className="p-3 rounded-lg bg-orange-600/20 border border-orange-500/30">
+            <div className="text-xs text-orange-400 mb-1">Target</div>
+            <div className="text-xl font-bold">150</div>
+            <div className="text-xs text-gray-400">→ 92% accuracy</div>
+          </div>
+        </div>
+
+        {/* Recommendation */}
+        <div className="mt-3 pt-3 border-t border-indigo-700">
+          <div className="text-sm text-gray-300">
+            {dualDatasetStatus.home_csv?.samples < 5 && '💡 Collect at least 5 HOME samples to train MLP'}
+            {dualDatasetStatus.home_csv?.samples >= 5 && dualDatasetStatus.home_csv?.samples < 150 && !mlpModelStatus.trained &&
+              `💡 ${150 - (dualDatasetStatus.home_csv?.samples || 0)} more samples recommended. You can train MLP now or continue collecting.`}
+            {dualDatasetStatus.home_csv?.samples >= 5 && !mlpModelStatus.trained &&
+              <button onClick={handleTrainMLP} className="ml-2 text-purple-400 underline hover:text-purple-300">Click to Train MLP</button>}
+            {mlpModelStatus.trained && dualDatasetStatus.home_csv?.samples < 150 &&
+              `✅ MLP trained (${mlpModelStatus.accuracy}%). Collect more samples for better accuracy.`}
+            {mlpModelStatus.trained && dualDatasetStatus.home_csv?.samples >= 150 &&
+              `🎯 Target reached! MLP ready with ${mlpModelStatus.accuracy}% accuracy.`}
+          </div>
+        </div>
+      </div>
+
+      {/* LIVE PREDICTION MODE - Shows after MLP model is trained */}
+      {mlpModelStatus.trained && (
+        <div className={`mb-6 p-4 rounded-xl border-2 transition-all ${livePredictEnabled
+          ? 'bg-gradient-to-r from-purple-900/50 to-pink-900/50 border-purple-500 shadow-lg shadow-purple-500/20'
+          : 'bg-gray-800/50 border-gray-700'
+          }`}>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <Play className={`w-6 ${livePredictEnabled ? 'text-purple-400 animate-pulse' : 'text-gray-400'}`} />
+              <div>
+                <div className="font-bold text-lg">🔮 Live MLP Prediction Mode</div>
+                <div className="text-sm text-gray-400">
+                  {livePredictEnabled
+                    ? `✅ Auto-predicting footsteps with MLP (${mlpModelStatus.accuracy}% accuracy)`
+                    : 'Enable to identify footsteps automatically when someone walks'}
+                </div>
+              </div>
+            </div>
+            <button
+              onClick={() => {
+                setLivePredictEnabled(!livePredictEnabled);
+                setPredictionMode(!livePredictEnabled);
+                showToast(livePredictEnabled ? '🔮 Live MLP prediction OFF' : '🔮 Live MLP prediction ON!', 'success');
+              }}
+              className={`px-6 py-3 rounded-xl font-bold transition-all ${livePredictEnabled
+                ? 'bg-red-500 hover:bg-red-600 text-white'
+                : 'bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white shadow-lg'
+                }`}
+            >
+              {livePredictEnabled ? '⏹️ Stop' : '▶️ Start Live Prediction'}
+            </button>
+          </div>
+          {livePredictEnabled && isPredicting && (
+            <div className="mt-3 flex items-center gap-2 text-purple-300">
+              <RefreshCw className="w-4 animate-spin" />
+              <span>🧠 MLP analyzing footstep with prediction rules...</span>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* STATUS BAR */}
       <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700 mb-6">
@@ -945,9 +1650,23 @@ function Vibrations() {
             <Cpu className="w-5 text-cyan-400" />
             <span className="font-medium">{status}</span>
           </div>
-          <div className="flex items-center gap-4 text-sm text-gray-400">
-            <span>Samples: {detectionStats.totalSamples}</span>
-            <span className="text-green-400">Events: {detectionStats.eventsDetected}</span>
+          <div className="flex items-center space-x-6 text-sm font-medium text-gray-400">
+            <div className="flex items-center space-x-2">
+              <Database className="w-4 h-4 text-blue-400" />
+              <span>Dataset: {Object.values(sampleCounts).reduce((a, b) => a + b, 0)}</span>
+            </div>
+            <div className="flex items-center space-x-2">
+              <Activity className="w-4 h-4 text-green-400" />
+              <span>Session: {detectionStats.totalSamples}</span>
+            </div>
+            <div className="flex items-center space-x-2">
+              <Zap className="w-4 h-4 text-yellow-400" />
+              <span>Events: {detectionStats.eventsDetected}</span>
+            </div>
+            <div className="flex items-center space-x-2">
+              <Trash2 className="w-4 h-4 text-red-400" />
+              <span>Noise: {detectionStats.noiseRejected}</span>
+            </div>
             {currentEventInfo && (
               <span className="text-yellow-400 animate-pulse">
                 Recording: {currentEventInfo.length} samples
@@ -957,11 +1676,11 @@ function Vibrations() {
         </div>
       </div>
 
-      {/* PREDICTION RESULT */}
+      {/* PREDICTION RESULT - Collapsible */}
       {prediction && prediction.formatted && (
-        <div className={`mb-6 p-5 rounded-xl border-2 transition-all ${prediction.is_intruder
-          ? 'bg-red-900/50 border-red-500 shadow-lg shadow-red-500/20'
-          : prediction.confidence >= 0.5
+        <div className={`mb-6 p-5 rounded-xl border-2 transition-all ${prediction.color_code === 'red'
+          ? 'bg-red-900/50 border-red-500 shadow-lg shadow-red-500/30 animate-pulse'
+          : prediction.color_code === 'green'
             ? 'bg-green-900/50 border-green-500 shadow-lg shadow-green-500/20'
             : 'bg-yellow-900/50 border-yellow-500 shadow-lg shadow-yellow-500/20'
           }`}>
@@ -969,10 +1688,47 @@ function Vibrations() {
             <div className="text-xl font-bold">
               {prediction.is_intruder ? '🚨 INTRUDER!' : prediction.confidence >= 0.5 ? '✅ FAMILY' : '⚠ UNCERTAIN'}
             </div>
-            {prediction.alert && <span className="text-sm opacity-75">{prediction.alert}</span>}
+            <div className="flex items-center gap-3">
+              {prediction.alert && <span className="text-sm opacity-75">{prediction.alert}</span>}
+              <button
+                onClick={() => setPrediction(null)}
+                className="p-2 hover:bg-gray-700/50 rounded-lg transition text-gray-400 hover:text-white"
+                title="Close prediction"
+              >
+                ✕
+              </button>
+            </div>
           </div>
           <div className="text-4xl font-bold mb-2">{prediction.formatted.person}</div>
-          <div className="text-xl mb-4">Confidence: {prediction.formatted.confidenceDisplay}</div>
+          <div className="text-xl mb-2">Confidence: {prediction.formatted.confidenceDisplay}</div>
+
+          {/* Enhanced Scoring Details */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4 text-sm bg-gray-900/50 rounded-lg p-3">
+            <div className="text-center">
+              <div className="text-gray-400">Anomaly Score</div>
+              <div className={`font-bold ${prediction.anomaly_score > prediction.threshold ? 'text-red-400' : 'text-green-400'}`}>
+                {prediction.anomaly_score?.toFixed(3) ?? 'N/A'}
+              </div>
+            </div>
+            <div className="text-center">
+              <div className="text-gray-400">Threshold</div>
+              <div className="font-bold text-blue-400">{prediction.threshold?.toFixed(3) ?? 'N/A'}</div>
+            </div>
+            <div className="text-center">
+              <div className="text-gray-400">Confidence Band</div>
+              <div className={`font-bold ${prediction.confidence_band === 'high' ? 'text-green-400' :
+                prediction.confidence_band === 'medium' ? 'text-yellow-400' : 'text-orange-400'
+                }`}>
+                {prediction.confidence_band?.toUpperCase() ?? 'N/A'}
+              </div>
+            </div>
+            <div className="text-center">
+              <div className="text-gray-400">Model Agreement</div>
+              <div className={`font-bold ${prediction.svm_agrees ? 'text-green-400' : prediction.svm_agrees === false ? 'text-yellow-400' : 'text-gray-400'}`}>
+                {prediction.svm_agrees === true ? '✓ Confirmed' : prediction.svm_agrees === false ? '⚠ Uncertain' : 'N/A'}
+              </div>
+            </div>
+          </div>
 
           {prediction.probabilities && (
             <div className="space-y-2">
@@ -983,7 +1739,9 @@ function Vibrations() {
                     <span className="w-24 text-sm">{name}</span>
                     <div className="flex-1 bg-gray-700 rounded-full h-3 overflow-hidden">
                       <div
-                        className={`h-full rounded-full transition-all duration-500 ${name === prediction.formatted.person ? 'bg-gradient-to-r from-cyan-400 to-blue-500' : 'bg-gray-500'
+                        className={`h-full rounded-full transition-all duration-500 ${name === 'INTRUDER'
+                          ? 'bg-gradient-to-r from-red-500 to-red-400'
+                          : 'bg-gradient-to-r from-green-400 to-emerald-500'
                           }`}
                         style={{ width: `${prob * 100}%` }}
                       />
@@ -1050,6 +1808,357 @@ function Vibrations() {
           </div>
         </div>
       </div>
+
+      {/* ============== MULTI-MODEL TRAINING CENTER ============== */}
+      <div className="bg-gradient-to-br from-purple-900/40 to-indigo-900/40 p-5 rounded-xl border border-purple-700/50 mb-6">
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-3">
+            <BrainCircuit className="w-6 text-purple-400" />
+            <div>
+              <h3 className="text-lg font-bold">🧠 Model Training Center</h3>
+              <p className="text-sm text-gray-400">Select model type, datasets, and train with K-Fold Cross-Validation</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {/* Active Model Status */}
+            <div className={`px-3 py-1 rounded-full text-sm font-medium ${modelsStatus[activeModel]?.trained
+              ? 'bg-green-500/20 text-green-400 border border-green-500/30'
+              : 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30'
+              }`}>
+              Active: {modelsStatus[activeModel]?.short_name || 'MLP'}
+              {modelsStatus[activeModel]?.trained ? ` (${modelsStatus[activeModel]?.cv_accuracy || 0}%)` : ' - Not Trained'}
+            </div>
+          </div>
+        </div>
+
+        {/* Model Selector Dropdown */}
+        <div className="mb-4 p-4 bg-gray-800/50 rounded-lg border border-gray-700">
+          <div className="flex items-center justify-between mb-3">
+            <span className="text-sm font-semibold text-gray-300">🎯 Select Model Type</span>
+            <span className="text-xs text-gray-500">Choose the ML model to train</span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {availableModels.map((model) => (
+              <button
+                key={model.name}
+                onClick={() => setSelectedModel(model.name)}
+                disabled={!model.ready}
+                className={`p-3 rounded-lg border-2 transition-all text-left ${selectedModel === model.name
+                  ? 'bg-purple-600/30 border-purple-500 shadow-lg shadow-purple-500/20'
+                  : model.ready
+                    ? 'bg-gray-700/30 border-gray-600 hover:border-gray-500'
+                    : 'bg-gray-800/30 border-gray-700 opacity-50 cursor-not-allowed'
+                  }`}
+              >
+                <div className="flex items-center justify-between mb-1">
+                  <span className="font-bold text-sm">{model.short_name}</span>
+                  {model.trained && (
+                    <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded">
+                      {model.cv_accuracy}%
+                    </span>
+                  )}
+                  {!model.ready && (
+                    <span className="text-xs bg-yellow-500/20 text-yellow-400 px-2 py-0.5 rounded">
+                      Soon
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-gray-400">{model.description}</p>
+                {model.is_active && (
+                  <div className="mt-2 text-xs text-cyan-400 flex items-center gap-1">
+                    <CheckCircle className="w-3 h-3" /> Active for predictions
+                  </div>
+                )}
+              </button>
+            ))}
+          </div>
+
+          {/* Quick Model Info */}
+          <div className="mt-3 flex items-center justify-between text-xs text-gray-500">
+            <span>Selected: <span className="text-purple-400 font-medium">{modelsStatus[selectedModel]?.display_name || selectedModel}</span></span>
+            {modelsStatus[selectedModel]?.trained && (
+              <button
+                onClick={() => handleSetActiveModel(selectedModel)}
+                disabled={activeModel === selectedModel}
+                className={`px-2 py-1 rounded transition ${activeModel === selectedModel
+                  ? 'bg-green-600/20 text-green-400 cursor-default'
+                  : 'bg-cyan-600/30 hover:bg-cyan-600/50 text-cyan-300'
+                  }`}
+              >
+                {activeModel === selectedModel ? '✓ Active' : '→ Set as Active'}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Dataset Selection */}
+        <div className="mb-4">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-sm font-semibold text-gray-300">📁 Select Datasets for Training</span>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setSelectedDatasets(availableDatasets)}
+                className="text-xs bg-purple-600/30 hover:bg-purple-600/50 px-2 py-1 rounded transition"
+              >
+                Select All
+              </button>
+              <button
+                onClick={() => setSelectedDatasets([])}
+                className="text-xs bg-gray-600/30 hover:bg-gray-600/50 px-2 py-1 rounded transition"
+              >
+                Clear All
+              </button>
+            </div>
+          </div>
+
+          {availableDatasets.length > 0 ? (
+            <div className="flex flex-wrap gap-2 p-3 bg-gray-800/50 rounded-lg border border-gray-700">
+              {availableDatasets.map((dataset) => {
+                const isSelected = selectedDatasets.includes(dataset);
+                const datasetInfo = dualDatasetStatus.home_csv?.persons_details?.[dataset] || {};
+                const sampleCount = Object.entries(sampleCounts).find(([k]) => k === dataset)?.[1] || 0;
+
+                return (
+                  <button
+                    key={dataset}
+                    onClick={() => {
+                      if (isSelected) {
+                        setSelectedDatasets(selectedDatasets.filter(d => d !== dataset));
+                      } else {
+                        setSelectedDatasets([...selectedDatasets, dataset]);
+                      }
+                    }}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg border transition-all ${isSelected
+                      ? 'bg-purple-600/40 border-purple-500 text-purple-200 shadow-lg shadow-purple-500/20'
+                      : 'bg-gray-700/40 border-gray-600 text-gray-300 hover:bg-gray-700/60'
+                      }`}
+                  >
+                    <div className={`w-4 h-4 rounded border-2 flex items-center justify-center ${isSelected ? 'bg-purple-500 border-purple-400' : 'border-gray-500'
+                      }`}>
+                      {isSelected && <CheckCircle className="w-3 h-3 text-white" />}
+                    </div>
+                    <User className="w-4 h-4" />
+                    <span className="font-medium">{dataset}</span>
+                    <span className="text-xs bg-gray-600/60 px-2 py-0.5 rounded">
+                      {sampleCount} samples
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="p-4 bg-gray-800/50 rounded-lg border border-gray-700 text-center text-gray-400">
+              No datasets available. Save some footstep events first!
+            </div>
+          )}
+
+          <div className="mt-2 text-xs text-gray-500">
+            Selected: {selectedDatasets.length} of {availableDatasets.length} datasets
+            ({selectedDatasets.length > 0 ? selectedDatasets.join(', ') : 'None'})
+          </div>
+        </div>
+
+        {/* Training Actions */}
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            onClick={handleTrainModel}
+            disabled={isTraining || selectedDatasets.length === 0 || !modelsStatus[selectedModel]?.ready}
+            className="bg-gradient-to-r from-purple-500 to-indigo-500 px-6 py-3 rounded-xl flex gap-2 items-center font-bold disabled:opacity-50 disabled:cursor-not-allowed hover:from-purple-600 hover:to-indigo-600 transition-all shadow-lg shadow-purple-500/30"
+          >
+            {isTraining ? (
+              <>
+                <RefreshCw className="animate-spin w-5" />
+                Training {modelsStatus[selectedModel]?.short_name || 'Model'}...
+              </>
+            ) : (
+              <>
+                <BrainCircuit className="w-5" />
+                🧠 Train {modelsStatus[selectedModel]?.short_name || 'Model'}
+              </>
+            )}
+          </button>
+
+          {/* Predict with Active Model */}
+          <button
+            onClick={handlePredictWithModel}
+            disabled={isPredicting || validatedEvents.length === 0 || !modelsStatus[activeModel]?.trained}
+            className="bg-gradient-to-r from-cyan-500 to-blue-500 px-5 py-3 rounded-xl flex gap-2 items-center font-bold disabled:opacity-50 disabled:cursor-not-allowed hover:from-cyan-600 hover:to-blue-600 transition-all shadow-lg shadow-cyan-500/30"
+          >
+            {isPredicting ? (
+              <>
+                <RefreshCw className="animate-spin w-5" />
+                Predicting...
+              </>
+            ) : (
+              <>
+                <Zap className="w-5" />
+                🔮 Predict ({modelsStatus[activeModel]?.short_name || 'MLP'})
+              </>
+            )}
+          </button>
+
+          {trainingDetails && (
+            <button
+              onClick={() => setShowTrainingDetails(!showTrainingDetails)}
+              className="bg-gray-700 hover:bg-gray-600 px-4 py-3 rounded-xl flex gap-2 items-center transition"
+            >
+              {showTrainingDetails ? <EyeOff className="w-5" /> : <Eye className="w-5" />}
+              {showTrainingDetails ? 'Hide' : 'Show'} Details
+            </button>
+          )}
+
+          <div className="ml-auto text-sm text-gray-400">
+            {selectedDatasets.length === 0
+              ? '⚠️ Select at least one dataset'
+              : `Ready to train ${modelsStatus[selectedModel]?.short_name || 'model'} on ${selectedDatasets.length} dataset(s)`}
+          </div>
+        </div>
+
+        {/* Models Status Summary */}
+        <div className="mt-4 pt-4 border-t border-gray-700/50">
+          <div className="text-xs text-gray-500 mb-2">📊 Models Overview:</div>
+          <div className="flex flex-wrap gap-2">
+            {availableModels.map((model) => (
+              <div
+                key={model.name}
+                className={`px-3 py-1.5 rounded-lg text-xs flex items-center gap-2 ${model.trained
+                  ? model.is_active
+                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+                    : 'bg-green-500/20 text-green-300 border border-green-500/30'
+                  : 'bg-gray-700/30 text-gray-400 border border-gray-600/30'
+                  }`}
+              >
+                <span className="font-medium">{model.short_name}</span>
+                {model.trained ? (
+                  <span>{model.cv_accuracy}%</span>
+                ) : model.ready ? (
+                  <span>Not trained</span>
+                ) : (
+                  <span>Coming soon</span>
+                )}
+                {model.is_active && <span className="text-cyan-400">★</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* DETAILED TRAINING RESULTS PANEL */}
+      {showTrainingDetails && trainingDetails && (
+        <div className="mb-6 p-4 bg-gradient-to-br from-indigo-900/60 to-purple-900/60 rounded-xl border border-indigo-600 shadow-lg">
+          <div className="flex items-center justify-between mb-4">
+            <div className="font-bold text-lg flex items-center gap-2">
+              <Brain className="w-5 text-indigo-400" />
+              {trainingDetails.modelDisplayName || 'Model'} Training Report
+            </div>
+            <button
+              onClick={() => setShowTrainingDetails(false)}
+              className="text-gray-400 hover:text-white transition-colors p-1"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+
+          {/* Model Badge */}
+          {trainingDetails.modelName && (
+            <div className="mb-3">
+              <span className="px-3 py-1 rounded-full text-sm font-medium bg-purple-600/40 text-purple-200 border border-purple-500/30">
+                {trainingDetails.modelName}
+              </span>
+            </div>
+          )}
+
+          {/* Accuracy Section */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+            <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+              <div className="text-2xl font-bold text-green-400">{trainingDetails.accuracy}%</div>
+              <div className="text-xs text-gray-400">Final Accuracy</div>
+            </div>
+            <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+              <div className="text-2xl font-bold text-blue-400">
+                {trainingDetails.cvAccuracy ?? 'N/A'}%
+              </div>
+              <div className="text-xs text-gray-400">CV Accuracy</div>
+            </div>
+            <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+              <div className="text-2xl font-bold text-yellow-400">±{trainingDetails.cvStd ?? 0}%</div>
+              <div className="text-xs text-gray-400">Std Dev</div>
+            </div>
+            <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+              <div className="text-2xl font-bold text-purple-400">{trainingDetails.nFolds}</div>
+              <div className="text-xs text-gray-400">Folds</div>
+            </div>
+          </div>
+
+          {/* Cross-Validation Scores */}
+          {trainingDetails.cvScores?.length > 0 && (
+            <div className="mb-4">
+              <div className="text-sm font-semibold text-gray-300 mb-2">
+                📊 Cross-Validation Fold Scores
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {trainingDetails.cvScores.map((score, idx) => (
+                  <div
+                    key={idx}
+                    className={`px-3 py-1 rounded-full text-sm font-medium ${score >= 90 ? 'bg-green-600/40 text-green-300' :
+                      score >= 80 ? 'bg-yellow-600/40 text-yellow-300' :
+                        'bg-red-600/40 text-red-300'
+                      }`}
+                  >
+                    Fold {idx + 1}: {score}%
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Sample Distribution */}
+          <div className="grid grid-cols-3 gap-3 mb-4">
+            <div className="bg-gray-800/60 rounded-lg p-3">
+              <div className="text-lg font-bold text-cyan-400">{trainingDetails.homeSamples}</div>
+              <div className="text-xs text-gray-400">HOME Samples</div>
+            </div>
+            <div className="bg-gray-800/60 rounded-lg p-3">
+              <div className="text-lg font-bold text-orange-400">{trainingDetails.intruderSamples}</div>
+              <div className="text-xs text-gray-400">INTRUDER (Synthetic)</div>
+            </div>
+            <div className="bg-gray-800/60 rounded-lg p-3">
+              <div className="text-lg font-bold text-white">{trainingDetails.totalSamples}</div>
+              <div className="text-xs text-gray-400">Total Samples</div>
+            </div>
+          </div>
+
+          {/* Datasets Used */}
+          {trainingDetails.datasets?.length > 0 && (
+            <div>
+              <div className="text-sm font-semibold text-gray-300 mb-2">
+                📁 Datasets Used for Training
+              </div>
+              <div className="bg-gray-800/60 rounded-lg p-3">
+                <div className="flex flex-wrap gap-2">
+                  {trainingDetails.datasets.map((dataset, idx) => (
+                    <div
+                      key={idx}
+                      className="flex items-center gap-2 px-3 py-2 bg-gray-700/60 rounded-lg border border-gray-600"
+                    >
+                      <User className="w-4 h-4 text-emerald-400" />
+                      <span className="font-medium text-emerald-300">{dataset.name}</span>
+                      <span className="text-xs text-gray-400 bg-gray-600/60 px-2 py-0.5 rounded">
+                        {dataset.samples} samples
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-2 text-xs text-gray-500">
+                  Total {trainingDetails.datasets.length} dataset(s) •
+                  {trainingDetails.datasetNames?.join(', ')}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* RESET & DATASET MANAGER */}
       <div className="bg-gray-800/50 p-4 rounded-xl border border-red-900/30 mb-6">
@@ -1125,27 +2234,30 @@ function Vibrations() {
                       </tr>
                     </thead>
                     <tbody>
-                      {datasetInfo.persons?.map((person) => (
-                        <tr key={person.name} className="border-b border-gray-800 hover:bg-gray-800/50">
-                          <td className="p-3">
-                            <span className={`px-2 py-1 rounded text-sm ${person.name === 'HOME' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
-                              }`}>
-                              {person.name === 'HOME' ? '🏠' : '🚨'} {person.name}
-                            </span>
-                          </td>
-                          <td className="p-3 text-gray-400">{person.type || person.name}</td>
-                          <td className="p-3 font-bold">{person.samples}</td>
-                          <td className="p-3">
-                            <button
-                              onClick={() => handleDeletePerson(person.name)}
-                              disabled={isDeleting || person.samples === 0}
-                              className="bg-red-500 hover:bg-red-600 px-3 py-1 rounded-full text-sm flex items-center gap-1 disabled:opacity-50 transition"
-                            >
-                              <Trash2 className="w-4" /> Delete
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
+                      {datasetInfo.persons?.map((person) => {
+                        // All HOME_ prefixed datasets are HOME class (green)
+                        const isHome = person.name.toUpperCase().startsWith('HOME');
+                        return (
+                          <tr key={person.name} className="border-b border-gray-800 hover:bg-gray-800/50">
+                            <td className="p-3">
+                              <span className={`px-2 py-1 rounded text-sm ${isHome ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
+                                {isHome ? '🏠' : '🚨'} {person.name}
+                              </span>
+                            </td>
+                            <td className="p-3 text-gray-400">{person.type || (isHome ? 'HOME' : 'UNKNOWN')}</td>
+                            <td className="p-3 font-bold">{person.samples}</td>
+                            <td className="p-3">
+                              <button
+                                onClick={() => handleDeletePerson(person.name)}
+                                disabled={isDeleting || person.samples === 0}
+                                className="bg-red-500 hover:bg-red-600 px-3 py-1 rounded-full text-sm flex items-center gap-1 disabled:opacity-50 transition"
+                              >
+                                <Trash2 className="w-4" /> Delete
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -1154,8 +2266,8 @@ function Vibrations() {
                   <span>🤖 Model: <strong className={datasetInfo.model_status === 'trained' ? 'text-green-400' : 'text-yellow-400'}>
                     {datasetInfo.model_status || 'not trained'}
                   </strong></span>
-                  {datasetInfo.model_accuracy && (
-                    <span>🎯 Accuracy: <strong className="text-cyan-400">{(datasetInfo.model_accuracy * 100).toFixed(1)}%</strong></span>
+                  {datasetInfo.model_accuracy != null && !isNaN(datasetInfo.model_accuracy) && (
+                    <span>🎯 Accuracy: <strong className="text-cyan-400">{datasetInfo.model_accuracy.toFixed(1)}%</strong></span>
                   )}
                 </div>
               </>
@@ -1180,6 +2292,7 @@ function Vibrations() {
                   <button
                     key={key}
                     onClick={() => handleSensitivityChange(key)}
+                    title={preset.description}
                     className={`px-4 py-2 rounded-lg font-medium transition-all ${sensitivity === key
                       ? 'bg-cyan-600 text-white shadow-lg'
                       : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
@@ -1190,6 +2303,7 @@ function Vibrations() {
                 ))}
                 <button
                   onClick={() => setSensitivity('custom')}
+                  title="Custom threshold"
                   className={`px-4 py-2 rounded-lg font-medium transition-all ${sensitivity === 'custom'
                     ? 'bg-purple-600 text-white shadow-lg'
                     : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
@@ -1198,46 +2312,108 @@ function Vibrations() {
                   🔧 Custom
                 </button>
               </div>
+              {/* Show selected preset description */}
+              {sensitivity !== 'custom' && SENSITIVITY_PRESETS[sensitivity] && (
+                <p className="text-xs text-gray-500 mt-2">
+                  {SENSITIVITY_PRESETS[sensitivity].description}
+                </p>
+              )}
             </div>
 
-            {/* Custom Threshold Slider - Extended Range */}
+            {/* Simple Sensitivity Slider */}
             <div className="mb-4 p-3 bg-gray-800 rounded-lg">
               <div className="flex items-center justify-between mb-2">
-                <label className="text-sm text-gray-400">Threshold Multiplier:</label>
-                <span className="text-cyan-400 font-bold">{customThreshold.toFixed(3)}x</span>
+                <label className="text-sm text-gray-400">🎚️ Spike Multiplier (vs recent noise):</label>
+                <span className="text-cyan-400 font-bold">{customThreshold.toFixed(1)}x</span>
               </div>
               <input
                 type="range"
-                min="0.01"
-                max="1.0"
-                step="0.01"
+                min="0.2"
+                max="6.0"
+                step="0.1"
                 value={customThreshold}
                 onChange={(e) => handleCustomThresholdChange(e.target.value)}
-                className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                className="w-full h-3 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
               />
               <div className="flex justify-between text-xs text-gray-500 mt-1">
-                <span>🔥 Extreme (0.01)</span>
-                <span>Normal (1.0)</span>
+                <span>🔊 Ultra Sensitive (0.2x)</span>
+                <span>🔇 Strict (6x)</span>
+              </div>
+              <p className="text-xs text-green-400 mt-2">
+                💡 Spike must be this many times larger than recent activity. Higher = rejects more noise.
+              </p>
+              <div className="mt-3 flex gap-2">
+                <button
+                  onClick={lowerThresholdEightyPercent}
+                  className="px-3 py-1.5 rounded-lg bg-cyan-700 hover:bg-cyan-600 text-sm"
+                >
+                  ⬇️ Reduce by 80%
+                </button>
+              </div>
+            </div>
+
+            {/* Raw Amplitude Gate (ADC) */}
+            <div className="mb-4 p-3 bg-gray-800 rounded-lg">
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-sm text-gray-400">🧱 Raw Amplitude Gate (ADC):</label>
+                <span className="text-emerald-400 font-bold">{rawGate} ADC</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="2000"
+                step="10"
+                value={rawGate}
+                onChange={(e) => handleRawGateChange(e.target.value)}
+                className="w-full h-3 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+              />
+              <div className="flex justify-between text-xs text-gray-500 mt-1">
+                <span>Off/Low</span>
+                <span>Strict</span>
+              </div>
+              <p className="text-xs text-emerald-400 mt-2">
+                💡 Below this |raw-baseline| is treated as noise (zeroed, no trigger). Lower to allow quieter steps.
+              </p>
+            </div>
+
+            {/* Simplified ML Confidence */}
+            <div className="mb-4 p-3 bg-gray-800 rounded-lg">
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-sm text-gray-400">🎯 Min Confidence for HOME:</label>
+                <span className="text-purple-400 font-bold">{(confidenceThreshold * 100).toFixed(0)}%</span>
+              </div>
+              <input
+                type="range"
+                min="0.3"
+                max="0.95"
+                step="0.05"
+                value={confidenceThreshold}
+                onChange={(e) => setConfidenceThreshold(parseFloat(e.target.value))}
+                className="w-full h-3 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
+              />
+              <div className="flex justify-between text-xs text-gray-500 mt-1">
+                <span>Lenient</span>
+                <span>Strict</span>
               </div>
             </div>
 
             {/* Current Detection Parameters */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
               <div className="bg-gray-800 p-3 rounded-lg">
-                <div className="text-gray-400">Min Samples</div>
-                <div className="font-bold">{DETECTION_CONFIG.MIN_SAMPLES}</div>
+                <div className="text-gray-400">Spike Mult</div>
+                <div className="font-bold text-cyan-400">{DETECTION_CONFIG.SPIKE_MULTIPLIER}x</div>
               </div>
               <div className="bg-gray-800 p-3 rounded-lg">
-                <div className="text-gray-400">Min SNR</div>
-                <div className="font-bold">{DETECTION_CONFIG.MIN_SNR}</div>
+                <div className="text-gray-400">Min Spike</div>
+                <div className="font-bold">{DETECTION_CONFIG.MIN_ABSOLUTE_SPIKE} ADC</div>
               </div>
               <div className="bg-gray-800 p-3 rounded-lg">
-                <div className="text-gray-400">Freq Range</div>
-                <div className="font-bold">{DETECTION_CONFIG.MIN_DOMINANT_FREQ}-{DETECTION_CONFIG.MAX_DOMINANT_FREQ} Hz</div>
+                <div className="text-gray-400">Min Peak</div>
+                <div className="font-bold">{DETECTION_CONFIG.MIN_PEAK_HEIGHT} ADC</div>
               </div>
               <div className="bg-gray-800 p-3 rounded-lg">
-                <div className="text-gray-400">Threshold</div>
-                <div className="font-bold text-cyan-400">{customThreshold.toFixed(1)}x</div>
+                <div className="text-gray-400">Gain</div>
+                <div className="font-bold">{DETECTION_CONFIG.GAIN}x</div>
               </div>
             </div>
           </div>
