@@ -50,6 +50,38 @@ export default defineConfig({
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
+      '/available_models': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/train_selected_model': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/predict_selected_model': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/set_active_model': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/model_status': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/api': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/person_ensemble_status': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/dataset_sample_counts': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
     },
   },
   build: {
