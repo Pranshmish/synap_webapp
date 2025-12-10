@@ -1,12 +1,7 @@
-import { Navigate } from "react-router-dom";
-import { useAuth } from "../hooks/useAuth";
-
+// Auth disabled for development - always allow access
 const ProtectedRoute = ({ children }) => {
-  const { user, loading } = useAuth();
-
-  if (loading) return <div className="text-center text-lg mt-20">Checking authentication...</div>;
-
-  return user ? children : <Navigate to="/login" replace />;
+  // Bypass authentication - directly render children
+  return children;
 };
 
 export default ProtectedRoute;

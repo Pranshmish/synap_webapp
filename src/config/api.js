@@ -12,6 +12,8 @@ export const ENDPOINTS = {
     DATASET: '/dataset',
     DATASET_DOWNLOAD: '/dataset/download',
     DATASET_UPLOAD: '/dataset/upload',
+    DATASET_LIST: '/dataset/list',
+    DATASET_PREVIEW: '/dataset/preview',
     TRAIN: '/train',
     FEATURES: '/model/features',
     // MLP Endpoints
@@ -54,17 +56,33 @@ export const BUFFER_CONFIG = {
 // API Helper Functions
 export const api = {
     /**
-     * Save training data chunk to backend (HOME samples only for training)
-     * @param {number[]} rawTimeSeries - Array of 200 ADC values
-     * @param {string} label - Label (HOME for training)
+     * Save training data chunk to backend with optional analysis data
+     * @param {number[]} rawTimeSeries - Array of ADC values
+     * @param {string} label - Label (HOME_Name or INTRUDER_Name)
+     * @param {Object} analysisData - Optional {fftData, lifData, filteredWaveform}
      * @returns {Promise<{success: boolean, samples_per_person: Object}>}
      */
-    async saveTrainData(rawTimeSeries, label) {
+    async saveTrainData(rawTimeSeries, label, analysisData = null) {
+        const dataItem = { raw_time_series: rawTimeSeries };
+
+        // Add optional analysis data if provided
+        if (analysisData) {
+            if (analysisData.fftData) {
+                dataItem.fft_data = analysisData.fftData;
+            }
+            if (analysisData.lifData) {
+                dataItem.lif_data = analysisData.lifData;
+            }
+            if (analysisData.filteredWaveform) {
+                dataItem.filtered_waveform = analysisData.filteredWaveform;
+            }
+        }
+
         const response = await fetch(`${API_BASE_URL}${ENDPOINTS.TRAIN_DATA}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                data: [{ raw_time_series: rawTimeSeries }],
+                data: [dataItem],
                 label: label,
                 train_model: false,
             }),
@@ -76,6 +94,7 @@ export const api = {
 
         return response.json();
     },
+
 
     /**
      * Save multiple training data chunks at once
@@ -274,6 +293,61 @@ export const api = {
     },
 
     /**
+     * Download an individual person's dataset as ZIP
+     * @param {string} personName - Name of the person/dataset to download
+     * @returns {Promise<Blob>}
+     */
+    async downloadIndividualDataset(personName) {
+        const response = await fetch(`${API_BASE_URL}${ENDPOINTS.DATASET_DOWNLOAD}/${encodeURIComponent(personName)}?t=${Date.now()}`, {
+            method: 'GET',
+        });
+
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.detail || `Download failed: ${response.status}`);
+        }
+
+        return response.blob();
+    },
+
+    /**
+     * Get list of all available datasets with metadata
+     * @returns {Promise<{datasets: Array<{name: string, sample_count: number, waveform_count: number, size_kb: number, last_modified: string}>, total_samples: number, total_datasets: number}>}
+     */
+    async getDatasetList() {
+        const response = await fetch(`${API_BASE_URL}${ENDPOINTS.DATASET_LIST}`, {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch dataset list: ${response.status}`);
+        }
+
+        return response.json();
+    },
+
+    /**
+     * Get preview of a person's dataset including sample data and statistics
+     * @param {string} personName - Name of the person/dataset to preview
+     * @param {number} limit - Max number of samples to return (default 20)
+     * @returns {Promise<{person: string, samples: Array, total_samples: number, waveform_count: number, feature_stats: Object}>}
+     */
+    async getDatasetPreview(personName, limit = 20) {
+        const response = await fetch(`${API_BASE_URL}${ENDPOINTS.DATASET_PREVIEW}/${encodeURIComponent(personName)}?limit=${limit}`, {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+        });
+
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.detail || `Preview failed: ${response.status}`);
+        }
+
+        return response.json();
+    },
+
+    /**
      * Get feature names used by the model
      * @returns {Promise<{feature_count: number, features: string[], categories: Object}>}
      */
@@ -290,6 +364,7 @@ export const api = {
     },
 
     // ============== NEW MLP METHODS ==============
+
 
     /**
      * Train Simple MLP model
@@ -450,6 +525,75 @@ export const api = {
 
         if (!response.ok) {
             throw new Error(`Failed to fetch model status: ${response.status}`);
+        }
+
+        return response.json();
+    },
+
+    // ============================================================================
+    // SIGNAL & WAVELET VISUALIZATION API
+    // ============================================================================
+
+    /**
+     * Get list of available visualization sources (datasets with waveform data)
+     * @returns {Promise<{success: boolean, sources: Array<{name: string, waveform_count: number}>}>}
+     */
+    async getVisualizationSources() {
+        const response = await fetch(`${API_BASE_URL}/api/visualization/sources`, {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch sources: ${response.status}`);
+        }
+
+        return response.json();
+    },
+
+    /**
+     * Get list of available samples for a source
+     * @param {string} source - Dataset source (e.g., "HOME_Dixit")
+     * @returns {Promise<{success: boolean, samples: Array<{filename: string, timestamp: string}>}>}
+     */
+    async getVisualizationSamples(source) {
+        const response = await fetch(`${API_BASE_URL}/api/visualization/samples/${encodeURIComponent(source)}`, {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch samples: ${response.status}`);
+        }
+
+        return response.json();
+    },
+
+    /**
+     * Get signal visualization data (time series, FFT, wavelet scalogram)
+     * @param {Object} params - Visualization parameters
+     * @param {string} params.sample_id - Sample identifier (timestamp or filename)
+     * @param {string} params.source - Dataset source (e.g., "HOME_Dixit")
+     * @param {number} [params.max_points=2048] - Max time series points
+     * @param {number} [params.fft_n_points=1024] - FFT size
+     * @param {Object} [params.wavelet] - Wavelet config {type, family, num_scales}
+     * @returns {Promise<{success: boolean, time_series: Object, fft: Object, wavelet: Object, sample_info: Object}>}
+     */
+    async getSignalVisualization(params) {
+        const response = await fetch(`${API_BASE_URL}/api/visualization/signal_wavelet`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                sample_id: params.sample_id,
+                source: params.source,
+                max_points: params.max_points || 2048,
+                fft_n_points: params.fft_n_points || 1024,
+                wavelet: params.wavelet || { type: 'cwt', family: 'morl', num_scales: 32 }
+            }),
+        });
+
+        if (!response.ok) {
+            throw new Error(`Visualization failed: ${response.status}`);
         }
 
         return response.json();

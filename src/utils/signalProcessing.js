@@ -30,7 +30,7 @@ export const DETECTION_CONFIG = {
 
     // === NOISE FLOOR TRACKING (Rolling MAD) ===
     NOISE_WINDOW_SAMPLES: 100,   // 500ms at 200Hz
-    ADAPTIVE_THRESHOLD_MULT: 2.9, // Signal must be 2.9x MAD to trigger (optimized value)
+    ADAPTIVE_THRESHOLD_MULT: 6.0, // Signal must be 6x MAD to trigger (increased for better noise rejection)
     MIN_NOISE_FLOOR: 0.015,      // Minimum noise floor (normalized) - locked to 0.0150
 
     // === ENERGY-TRIGGERED DETECTION ===
@@ -71,8 +71,8 @@ export const DETECTION_CONFIG = {
     TARGET_SAMPLES: 200,         // Resample to 400ms at 200Hz
 
     // === RAW AMPLITUDE GATE (ADC units) ===
-    // Treat |raw-baseline| below this as noise (no trigger). 0 = disabled.
-    RAW_DELTA_GATE_ADC: 0
+    // Treat |raw-baseline| below this as noise (no trigger). Set to 110 for better noise rejection.
+    RAW_DELTA_GATE_ADC: 110
 };
 
 // Sensitivity presets
@@ -80,34 +80,38 @@ export const SENSITIVITY_PRESETS = {
     low: {
         name: '🔇 Low',
         description: 'Only very strong footsteps',
-        ADAPTIVE_THRESHOLD_MULT: 3.5,
+        ADAPTIVE_THRESHOLD_MULT: 8.0,
         MIN_RMS_RAW: 0.05,
         MIN_DURATION_MS: 30,
-        GAIN: 35.0
+        GAIN: 35.0,
+        RAW_DELTA_GATE_ADC: 150
     },
     medium: {
         name: '🔉 Medium',
         description: 'Balanced (recommended)',
-        ADAPTIVE_THRESHOLD_MULT: 2.9,
+        ADAPTIVE_THRESHOLD_MULT: 6.0,
         MIN_RMS_RAW: 0.005,
         MIN_DURATION_MS: 20,
-        GAIN: 50.0
+        GAIN: 50.0,
+        RAW_DELTA_GATE_ADC: 110
     },
     high: {
         name: '🔊 High',
         description: 'Sensitive - quieter footsteps',
-        ADAPTIVE_THRESHOLD_MULT: 1.5,
+        ADAPTIVE_THRESHOLD_MULT: 4.0,
         MIN_RMS_RAW: 0.012,
         MIN_DURATION_MS: 15,
-        GAIN: 65.0
+        GAIN: 65.0,
+        RAW_DELTA_GATE_ADC: 80
     },
     ultra: {
         name: '📡 Ultra',
         description: 'Maximum - may catch some noise',
-        ADAPTIVE_THRESHOLD_MULT: 1.0,
+        ADAPTIVE_THRESHOLD_MULT: 2.5,
         MIN_RMS_RAW: 0.008,
         MIN_DURATION_MS: 10,
-        GAIN: 80.0
+        GAIN: 80.0,
+        RAW_DELTA_GATE_ADC: 50
     }
 };
 
@@ -856,12 +860,28 @@ export class FootstepEventDetector {
             this.lastEventTime = Date.now();
             console.log(`✅ VALID FOOTSTEP:`, validation.metrics);
 
+            // Compute LIF neuron response for the event
+            const lifNeuron = new LIFNeuron(0.020, 0.025, 0.010, this.config.SAMPLE_RATE);
+            const lifMembrane = [];
+            const lifSpikes = [];
+
+            for (let i = 0; i < validation.centered.length; i++) {
+                const result = lifNeuron.step(validation.centered[i]);
+                lifMembrane.push(result.membrane);
+                lifSpikes.push(result.spiked ? 1 : 0);
+            }
+
+            const lifTime = validation.centered.map((_, i) => i / this.config.SAMPLE_RATE);
+
             return {
                 raw: eventCopy,
                 centered: validation.centered,
                 metrics: validation.metrics,
                 frequencies: validation.frequencies,
                 magnitudes: validation.magnitudes,
+                lifMembrane: lifMembrane,
+                lifSpikes: lifSpikes,
+                lifTime: lifTime,
                 baselineMean: this.baselineMean,
                 noiseFloor: this.noiseFloor,
                 timestamp: Date.now(),

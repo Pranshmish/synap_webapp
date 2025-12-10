@@ -37,7 +37,11 @@ import {
   Brain,
   User,
   X,
+  Waves,
 } from "lucide-react";
+
+// Import SignalVisualization component
+import SignalVisualization from "../components/SignalVisualization";
 
 // Import API and utilities
 import { api, BUFFER_CONFIG } from "../config/api";
@@ -54,6 +58,7 @@ import {
   SENSITIVITY_PRESETS,
   mean,
   std,
+  computeFFT,
 } from "../utils/signalProcessing";
 
 ChartJS.register(
@@ -111,8 +116,9 @@ const fftChartOptions = {
 
 function Vibrations() {
   // ============== CORE STATE ==============
-  // All data is saved as HOME - INTRUDER is detected by MLP, not stored
+  // Data can be saved as HOME or INTRUDER based on saveAsIntruder toggle
   const [labelName, setLabelName] = useState(""); // Person name (e.g., Apurv, Samir)
+  const [saveAsIntruder, setSaveAsIntruder] = useState(false); // Toggle to save as INTRUDER class
   const [status, setStatus] = useState("Idle — Connect serial to begin");
   const [prediction, setPrediction] = useState(null);
   const [isConnected, setIsConnected] = useState(false);
@@ -188,6 +194,17 @@ function Vibrations() {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const fileInputRef = useRef(null);
 
+  // ============== DATASET PREVIEW ==============
+  const [showDatasetPreview, setShowDatasetPreview] = useState(false);
+  const [previewData, setPreviewData] = useState(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [downloadingPerson, setDownloadingPerson] = useState(null); // Track which person's dataset is downloading
+
+  // ============== SIGNAL VISUALIZATION ==============
+  const [showVisualization, setShowVisualization] = useState(false);
+  const [vizSource, setVizSource] = useState(null);
+  const [vizSampleId, setVizSampleId] = useState(null);
+
   // ============== SIGNAL DATA ==============
   const [amplifiedData, setAmplifiedData] = useState([]);
   const [fftData, setFftData] = useState({ frequencies: [], magnitudes: [] });
@@ -232,12 +249,51 @@ function Vibrations() {
   // ============== REFS ==============
   const portRef = useRef(null);
   const readerRef = useRef(null);
+  const readableStreamClosedRef = useRef(null);
   const stopRef = useRef(false);
   const alarmRef = useRef(null);
   const detectorRef = useRef(null);
   const lifNeuronRef = useRef(null);
   const lastSaveTimeRef = useRef(0);
   const lineBufferRef = useRef("");
+
+  // High-performance buffers for visualization
+  const amplifiedDataRef = useRef([]); // Stores {time, value}
+  const lifDataRef = useRef([]);       // Stores {time, membrane}
+  const spikeMarkersRef = useRef([]);  // Stores {time, value}
+  const lastStatusUpdateRef = useRef(0);
+  const animationFrameRef = useRef(null);
+
+  // ============== VISUALIZATION LOOP ==============
+  // Syncs mutable refs to React state at 60FPS (screen refresh rate) to prevent UI freezing
+  useEffect(() => {
+    const updateVisualization = () => {
+      if (amplifiedDataRef.current.length > 0) {
+        // Update amplified data state
+        setAmplifiedData([...amplifiedDataRef.current]);
+      }
+
+      if (lifDataRef.current.length > 0) {
+        // Update LIF data state
+        setLifData([...lifDataRef.current]);
+      }
+
+      if (spikeMarkersRef.current.length > 0) {
+        setSpikeMarkers([...spikeMarkersRef.current]);
+      }
+
+      animationFrameRef.current = requestAnimationFrame(updateVisualization);
+    };
+
+    // Start loop
+    animationFrameRef.current = requestAnimationFrame(updateVisualization);
+
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, []);
 
   // ============== INITIALIZE DETECTOR & LIF ==============
   useEffect(() => {
@@ -341,11 +397,21 @@ function Vibrations() {
           setMlpModelStatus(datasetStatus.mlp_model);
         }
 
-        // Update available datasets from sample_counts (full names like HOME_Apurv)
-        // This is more reliable than home_csv.persons which only has short names
-        const datasetNames = Object.keys(samplesPerPerson).filter(name =>
+        // Update available datasets - try sample_counts first, then fall back to individual_files
+        let datasetNames = Object.keys(samplesPerPerson).filter(name =>
           name.toUpperCase().startsWith('HOME')
         );
+
+        // If no datasets from sample_counts, use individual_files from dual_dataset
+        if (datasetNames.length === 0 && datasetStatus.dual_dataset?.individual_files) {
+          datasetNames = datasetStatus.dual_dataset.individual_files.map(f => f.name);
+          // Also update sample counts from individual files
+          const countsFromFiles = {};
+          datasetStatus.dual_dataset.individual_files.forEach(f => {
+            countsFromFiles[f.name] = f.samples;
+          });
+          setSampleCounts(countsFromFiles);
+        }
         console.log('[fetchStatus] Available datasets:', datasetNames);
 
         if (datasetNames.length > 0) {
@@ -392,9 +458,10 @@ function Vibrations() {
   // ============== CLEANUP ==============
   useEffect(() => {
     return () => {
+      // Force immediate cleanup on unmount
       stopRef.current = true;
-      readerRef.current?.cancel().catch(() => { });
-      portRef.current?.close().catch(() => { });
+      if (readerRef.current) readerRef.current.cancel().catch(() => { });
+      // Note: Full async cleanup can't be guaranteed here, but we set flags
     };
   }, []);
 
@@ -402,10 +469,13 @@ function Vibrations() {
   const connectSerial = async () => {
     try {
       const port = await navigator.serial.requestPort();
-      await port.open({ baudRate: BUFFER_CONFIG.BAUD_RATE });
+      await port.open({ baudRate: BUFFER_CONFIG?.BAUD_RATE || 115200 }); // Default buffer config fallback
 
       const decoder = new TextDecoderStream();
-      port.readable.pipeTo(decoder.writable);
+      // Pipe to writable and capture the closed promise
+      const readableStreamClosed = port.readable.pipeTo(decoder.writable);
+      readableStreamClosedRef.current = readableStreamClosed;
+
       const reader = decoder.readable.getReader();
 
       portRef.current = port;
@@ -426,18 +496,48 @@ function Vibrations() {
       const effectiveLabel = getEffectiveLabel();
       setStatus(`🟢 Connected — Recording as "${effectiveLabel}"...`);
 
-      readLoop(reader);
+      // Start reading without awaiting it here so initialization completes
+      readLoop(reader).catch(err => {
+        console.error("Read loop error:", err);
+        disconnectSerial();
+      });
     } catch (err) {
+      console.error(err);
       setStatus("❌ Failed to connect to serial port");
-      showToast("❌ Serial connection failed", "error");
+      showToast(`❌ Serial connection failed: ${err.message}`, "error");
+      disconnectSerial().catch(() => { }); // Attempt cleanup
     }
   };
 
   // ============== SERIAL: DISCONNECT ==============
   const disconnectSerial = async () => {
+    if (!isConnected && !portRef.current) return;
+
+    setStatus("🔌 Disconnecting...");
     stopRef.current = true;
-    await readerRef.current?.cancel().catch(() => { });
-    await portRef.current?.close().catch(() => { });
+
+    try {
+      // 1. Cancel the reader
+      if (readerRef.current) {
+        await readerRef.current.cancel();
+        readerRef.current = null;
+      }
+
+      // 2. Wait for the stream decoding to finish
+      if (readableStreamClosedRef.current) {
+        await readableStreamClosedRef.current.catch(() => { }); // Ignore stream errors during close
+        readableStreamClosedRef.current = null;
+      }
+
+      // 3. Close the port
+      if (portRef.current) {
+        await portRef.current.close();
+        portRef.current = null;
+      }
+    } catch (e) {
+      console.warn("Error during disconnect cleanup:", e);
+    }
+
     setIsConnected(false);
     setStatus("🔌 Disconnected");
   };
@@ -466,47 +566,43 @@ function Vibrations() {
     }
   };
 
-  // ============== PROCESS SERIAL LINE ==============
+  // ============== PROCESS SERIAL LINE (OPTIMIZED) ==============
   const processSerialLine = (line) => {
     if (!line) return;
 
-    // Parse ESP32 formats robustly: "Raw:1958", "Raw: 1958", "raw=1958", or just a number
+    // Parse ESP32 formats robustly
     let rawValue;
     const rawMatch = line.match(/Raw\s*[:=]?\s*(\d{1,4})/i);
     if (rawMatch) {
       rawValue = parseInt(rawMatch[1], 10);
     } else {
-      // Fallback: first integer on the line
       const anyNum = line.match(/\b(\d{1,4})\b/);
       rawValue = anyNum ? parseInt(anyNum[1], 10) : NaN;
     }
 
     if (isNaN(rawValue) || rawValue < 0 || rawValue > 4095) return;
 
-    // Process through detector
     const detector = detectorRef.current;
     if (!detector) return;
 
     const result = detector.processSample(rawValue);
     const timestamp = performance.now() / 1000;
 
-    // Update detection stats
+    // 1. Update Detection Stats - throttle to reduce renders
+    // Simple counter updates are cheap, but doing it 200/sec is still wasteful.
+    // We'll let React batching handle this for now as it's just a counter.
     setDetectionStats(prev => ({
       ...prev,
       totalSamples: prev.totalSamples + 1
     }));
 
-    // Store raw samples for manual capture (last 0.5 second = 100 samples)
+    // 2. Buffer Raw Data for Manual Capture
     manualBufferRef.current.push(rawValue);
-    if (manualBufferRef.current.length > 100) {
-      manualBufferRef.current.shift();
-    }
+    if (manualBufferRef.current.length > 100) manualBufferRef.current.shift();
 
-    // Update amplified signal graph
-    setAmplifiedData(prev => {
-      const newData = [...prev, { time: timestamp, value: result.filtered }];
-      return newData.slice(-500); // Keep last 500 points
-    });
+    // 3. Update Visualization Buffers (Mutable Refs) instead of State
+    amplifiedDataRef.current.push({ time: timestamp, value: result.filtered });
+    if (amplifiedDataRef.current.length > 500) amplifiedDataRef.current.shift();
 
     // ============== SAVE ALL VISIBLE MODE ==============
     // Captures everything that passes noise filter (rawGate ADC & spikeThreshold)
@@ -523,15 +619,35 @@ function Vibrations() {
         if (visibleBufferRef.current.length >= 20 && (now - lastVisibleSaveRef.current) > 500) {
           // Create event from visible buffer
           const capturedSamples = [...visibleBufferRef.current];
+          const centered = capturedSamples.map(v => v - (detector.baselineMean || 2048));
+
+          // Compute LIF for auto-captured event
+          const lifParams = { tau: 0.020, threshold: 0.025, refractory: 0.010, rate: 200 };
+          const tempLif = new LIFNeuron(lifParams.tau, lifParams.threshold, lifParams.refractory, lifParams.rate);
+          const lifMembrane = [];
+          const lifSpikes = [];
+          const normalizedInput = centered.map(v => Math.abs(v) / 500);
+
+          normalizedInput.forEach(val => {
+            const res = tempLif.step(val);
+            lifMembrane.push(res.membrane);
+            lifSpikes.push(res.spiked ? 1 : 0);
+          });
+
           const visibleEvent = {
             raw: capturedSamples,
-            centered: capturedSamples.map(v => v - (detector.baselineMean || 2048)),
+            centered: centered,
             metrics: {
               duration_ms: (capturedSamples.length / 200) * 1000,
               rms: Math.sqrt(capturedSamples.reduce((sum, v) => sum + Math.pow(v - (detector.baselineMean || 2048), 2), 0) / capturedSamples.length),
               peakDev: Math.max(...capturedSamples.map(v => Math.abs(v - (detector.baselineMean || 2048)))),
               samples: capturedSamples.length
             },
+            // Add LIF Data
+            lifMembrane: lifMembrane,
+            lifSpikes: lifSpikes,
+            lifTime: capturedSamples.map((_, i) => i / 200),
+
             baselineMean: detector.baselineMean || 2048,
             noiseFloor: detector.noiseFloor || 0.02,
             timestamp: now,
@@ -559,48 +675,39 @@ function Vibrations() {
       }
     }
 
-    // Process through LIF neuron
+    // 5. LIF Neuron Processing
     const lif = lifNeuronRef.current;
     if (lif && !result.isWarmup) {
-      const normalizedInput = Math.abs(result.filtered) / 500; // Normalize
+      const normalizedInput = Math.abs(result.filtered) / 500;
       const lifResult = lif.step(normalizedInput);
 
-      setLifData(prev => {
-        const newData = [...prev, { time: timestamp, membrane: lifResult.membrane }];
-        return newData.slice(-500);
-      });
+      lifDataRef.current.push({ time: timestamp, membrane: lifResult.membrane });
+      if (lifDataRef.current.length > 500) lifDataRef.current.shift();
 
       if (lifResult.spiked) {
-        setSpikeMarkers(prev => {
-          const newMarkers = [...prev, { time: timestamp, value: lifResult.membrane }];
-          return newMarkers.slice(-50);
-        });
+        spikeMarkersRef.current.push({ time: timestamp, value: lifResult.membrane });
+        if (spikeMarkersRef.current.length > 50) spikeMarkersRef.current.shift();
       }
     }
 
-    // Update status during warmup
-    if (result.isWarmup) {
-      const progress = result.warmupProgress ? (result.warmupProgress * 100).toFixed(0) : '...';
-      setStatus(`🔄 Warming up noise floor... ${progress}%`);
-      return;
-    }
-
-    // Update current event info
-    if (result.eventActive) {
-      setCurrentEventInfo({
-        length: result.eventLength,
-        energy: result.energy,
-        threshold: result.threshold,
-        noiseFloor: result.noiseFloor
-      });
-      setStatus(`📊 Capturing: ${result.eventLength} samples, energy=${result.energy?.toFixed(4) || '?'}`);
-    } else {
-      setCurrentEventInfo(null);
-      if (!result.event) {
-        // Show energy-based status with noise floor
-        const energyRatio = result.energy / Math.max(result.threshold, 0.001);
-        setStatus(`🟢 Noise: ${result.noiseFloor?.toFixed(4) || '?'} | Thresh: ${result.threshold?.toFixed(4) || '?'} | Energy: ${result.energy?.toFixed(4) || '?'} (${(energyRatio * 100).toFixed(0)}%)`);
+    // 6. Status Updates (Throttled)
+    const now = Date.now();
+    if (now - lastStatusUpdateRef.current > 200) { // Update status max 5 times/sec
+      if (result.isWarmup) {
+        const progress = result.warmupProgress ? (result.warmupProgress * 100).toFixed(0) : '...';
+        setStatus(`🔄 Warming up noise floor... ${progress}%`);
+      } else if (result.eventActive) {
+        setStatus(`📊 Capturing: ${result.eventLength} samples`);
+        setCurrentEventInfo({ length: result.eventLength, energy: result.energy, threshold: result.threshold, noiseFloor: result.noiseFloor });
+      } else {
+        setCurrentEventInfo(null);
+        if (!result.event) {
+          // Show energy-based status with noise floor
+          const energyRatio = result.energy / Math.max(result.threshold, 0.001);
+          setStatus(`🟢 Noise: ${result.noiseFloor?.toFixed(4) || '?'} | Thresh: ${result.threshold?.toFixed(4) || '?'} | Energy: ${result.energy?.toFixed(4) || '?'} (${(energyRatio * 100).toFixed(0)}%)`);
+        }
       }
+      lastStatusUpdateRef.current = now;
     }
 
     // Handle detected event (could be valid footstep or rejected noise)
@@ -653,21 +760,56 @@ function Vibrations() {
       setCaptureHighlight(null);
     }, 3000);
 
+    // Center the signal and compute FFT for manual capture
+    const centered = capturedSamples.map(v => v - (detector?.baselineMean || 2048));
+    const { frequencies, magnitudes } = computeFFT(centered, 200); // 200Hz sample rate
+
+    // Compute LIF response for manually captured event
+    const lifParams = { tau: 0.020, threshold: 0.025, refractory: 0.010, rate: 200 };
+    const tempLif = new LIFNeuron(lifParams.tau, lifParams.threshold, lifParams.refractory, lifParams.rate);
+    const lifMembrane = [];
+    const lifSpikes = [];
+
+    // Normalize input like the detector (approx 500 ADC peak reference)
+    const normalizedInput = centered.map(v => Math.abs(v) / 500);
+
+    normalizedInput.forEach(val => {
+      const res = tempLif.step(val);
+      lifMembrane.push(res.membrane);
+      lifSpikes.push(res.spiked ? 1 : 0);
+    });
+
     const manualEvent = {
       raw: capturedSamples,
-      centered: capturedSamples.map(v => v - (detector?.baselineMean || 2048)),
+      centered: centered,
       metrics: {
         duration_ms: (capturedSamples.length / 200) * 1000,
         rms: 0,
-        peakDev: Math.max(...capturedSamples.map(v => Math.abs(v - (detector?.baselineMean || 2048)))),
+        peakDev: Math.max(...centered.map(Math.abs)),
         samples: capturedSamples.length
       },
+      frequencies: frequencies,
+      magnitudes: magnitudes,
+      // Add LIF Data
+      lifMembrane: lifMembrane,
+      lifSpikes: lifSpikes,
+      lifTime: capturedSamples.map((_, i) => i / 200),
+
       baselineMean: detector?.baselineMean || 2048,
       noiseFloor: detector?.noiseFloor || 0.02,
       timestamp: captureTime,
       isNoise: false,
       manualCapture: true
     };
+
+    // Update FFT display for manual capture
+    if (frequencies && magnitudes && frequencies.length > 0) {
+      setFftData({
+        frequencies: frequencies.slice(0, 50),
+        magnitudes: magnitudes.slice(0, 50)
+      });
+      console.log('📊 FFT data updated from manual capture');
+    }
 
     // Add to validated events
     setValidatedEvents(prev => {
@@ -692,11 +834,16 @@ function Vibrations() {
       return;
     }
 
-    // Update FFT display
-    setFftData({
-      frequencies: event.frequencies.slice(0, 50),
-      magnitudes: event.magnitudes.slice(0, 50)
-    });
+    // Update FFT display - ensure data exists before setting
+    if (event.frequencies && event.magnitudes && event.frequencies.length > 0) {
+      setFftData({
+        frequencies: event.frequencies.slice(0, 50),
+        magnitudes: event.magnitudes.slice(0, 50)
+      });
+      console.log('📊 FFT data updated:', event.frequencies.length, 'frequency bins');
+    } else {
+      console.warn('⚠️ Event missing FFT data:', { hasFreq: !!event.frequencies, hasMag: !!event.magnitudes });
+    }
 
     // Add to validated events
     setValidatedEvents(prev => {
@@ -748,11 +895,11 @@ function Vibrations() {
   // ============== GET EFFECTIVE LABEL ==============
   const getEffectiveLabel = () => {
     const customName = labelName.trim();
+    const prefix = saveAsIntruder ? 'INTRUDER' : 'HOME';
     if (customName) {
-      // Always use HOME prefix - INTRUDER is detected by MLP, not stored
-      return `HOME_${customName}`;
+      return `${prefix}_${customName}`;
     }
-    return 'HOME';
+    return prefix;
   };
 
   // ============== PREDICT EVENT WITH MLP (Live Prediction) ==============
@@ -830,8 +977,22 @@ function Vibrations() {
 
         frontendConverted++;
 
-        // Send to backend and check actual save result
-        const result = await api.saveTrainData(backendData, effectiveLabel);
+        // Prepare analysis data for backend (FFT, LIF, filtered waveform)
+        const analysisData = {
+          fftData: event.frequencies && event.magnitudes ? {
+            frequencies: event.frequencies,
+            magnitudes: event.magnitudes
+          } : null,
+          lifData: event.lifMembrane ? {
+            membrane: event.lifMembrane,
+            spikes: event.lifSpikes || [],
+            time: event.lifTime || []
+          } : null,
+          filteredWaveform: event.centered || null
+        };
+
+        // Send to backend with analysis data for comprehensive plot saving
+        const result = await api.saveTrainData(backendData, effectiveLabel, analysisData);
 
         if (result.valid_samples > 0) {
           backendSaved++;
@@ -1135,7 +1296,7 @@ function Vibrations() {
   const handleDownloadDataset = async () => {
     setIsDownloading(true);
     try {
-      const response = await fetch('/dataset/download');
+      const response = await fetch(`/dataset/download?t=${Date.now()}`);
       if (!response.ok) {
         throw new Error('No dataset available');
       }
@@ -1194,6 +1355,44 @@ function Vibrations() {
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
       }
+    }
+  };
+
+  // ============== INDIVIDUAL DATASET DOWNLOAD ==============
+  const handleDownloadIndividualDataset = async (personName) => {
+    setDownloadingPerson(personName);
+    try {
+      const blob = await api.downloadIndividualDataset(personName);
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${personName}_dataset_${new Date().toISOString().slice(0, 10)}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+      showToast(`✅ Downloaded ${personName} dataset!`, 'success');
+    } catch (error) {
+      showToast(`❌ Download failed: ${error.message}`, 'error');
+    } finally {
+      setDownloadingPerson(null);
+    }
+  };
+
+  // ============== DATASET PREVIEW ==============
+  const handlePreviewDataset = async (personName) => {
+    setPreviewLoading(true);
+    setShowDatasetPreview(true);
+    setPreviewData(null);
+
+    try {
+      const result = await api.getDatasetPreview(personName, 50);
+      setPreviewData(result);
+    } catch (error) {
+      showToast(`❌ Preview failed: ${error.message}`, 'error');
+      setShowDatasetPreview(false);
+    } finally {
+      setPreviewLoading(false);
     }
   };
 
@@ -1299,8 +1498,8 @@ function Vibrations() {
 
       {/* SAVE LABEL SELECTOR + SETTINGS */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-        {/* PERSON NAME INPUT - Required, always saves as HOME_name */}
-        <div className={`bg-gray-800/50 p-4 rounded-xl border ${labelName.trim() ? 'border-green-600' : 'border-yellow-600'}`}>
+        {/* PERSON NAME INPUT + CLASS SELECTOR */}
+        <div className={`bg-gray-800/50 p-4 rounded-xl border ${labelName.trim() ? (saveAsIntruder ? 'border-red-600' : 'border-green-600') : 'border-yellow-600'}`}>
           <label className="block text-sm text-gray-400 mb-2 font-semibold">
             👤 Person Name for Dataset: <span className="text-red-400">*</span>
           </label>
@@ -1310,7 +1509,7 @@ function Vibrations() {
               value={labelName}
               onChange={(e) => setLabelName(e.target.value)}
               placeholder="Enter name (required)..."
-              className={`flex-1 text-white bg-gray-700 p-3 rounded-lg border focus:outline-none ${labelName.trim() ? 'border-green-600 focus:border-green-500' : 'border-yellow-600 focus:border-yellow-500'
+              className={`flex-1 text-white bg-gray-700 p-3 rounded-lg border focus:outline-none ${labelName.trim() ? (saveAsIntruder ? 'border-red-600 focus:border-red-500' : 'border-green-600 focus:border-green-500') : 'border-yellow-600 focus:border-yellow-500'
                 }`}
               onKeyPress={(e) => e.key === 'Enter' && labelName.trim() && showToast(`✅ Label: ${getEffectiveLabel()}`, 'success')}
             />
@@ -1321,12 +1520,36 @@ function Vibrations() {
               Set
             </button>
           </div>
+
+          {/* HOME/INTRUDER Toggle */}
+          <div className="flex items-center gap-4 mb-2 mt-3 p-2 bg-gray-900/50 rounded-lg">
+            <span className="text-sm text-gray-400">Save as:</span>
+            <button
+              onClick={() => setSaveAsIntruder(false)}
+              className={`px-4 py-2 rounded-lg font-semibold transition-all ${!saveAsIntruder
+                ? 'bg-green-600 text-white shadow-lg shadow-green-500/30'
+                : 'bg-gray-700 text-gray-400 hover:bg-gray-600'
+                }`}
+            >
+              🏠 HOME
+            </button>
+            <button
+              onClick={() => setSaveAsIntruder(true)}
+              className={`px-4 py-2 rounded-lg font-semibold transition-all ${saveAsIntruder
+                ? 'bg-red-600 text-white shadow-lg shadow-red-500/30'
+                : 'bg-gray-700 text-gray-400 hover:bg-gray-600'
+                }`}
+            >
+              🚨 INTRUDER
+            </button>
+          </div>
+
           <p className="text-xs text-gray-500">
             {labelName.trim()
-              ? <>Saving as: <strong className="text-base text-green-400">{getEffectiveLabel()}</strong></>
+              ? <>Saving as: <strong className={`text-base ${saveAsIntruder ? 'text-red-400' : 'text-green-400'}`}>{getEffectiveLabel()}</strong></>
               : <span className="text-yellow-400">⚠️ Name required to save samples</span>
             }
-            <span className="ml-2 text-gray-600">• INTRUDER is detected by MLP, not stored</span>
+            <span className="ml-2 text-gray-600">• {saveAsIntruder ? 'Training INTRUDER detection' : 'Training HOME recognition'}</span>
           </p>
         </div>
 
@@ -1399,56 +1622,7 @@ function Vibrations() {
         </div>
       </div>
 
-      {/* SAMPLE COUNTS - ONE-CLASS ANOMALY DETECTION */}
-      <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700 mb-6">
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2">
-            <Users className="w-5 text-cyan-400" />
-            <span className="font-semibold">Training Data (One-Class Anomaly Detection)</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className={`px-2 py-1 rounded text-xs ${mlpModelStatus.trained ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
-              {mlpModelStatus.trained ? `✓ MLP Ready (${mlpModelStatus.accuracy}%)` : '⚠ Not Trained'}
-            </span>
-            <button onClick={fetchStatus} className="p-2 hover:bg-gray-700 rounded-lg transition">
-              <RefreshCw className="w-4" />
-            </button>
-          </div>
-        </div>
-        <div className="grid grid-cols-2 gap-4">
-          {/* HOME Counter - Main training data */}
-          <div className="p-4 rounded-xl bg-gradient-to-r from-green-600 to-emerald-600 shadow-lg shadow-green-500/20">
-            <div className="flex items-center gap-2 mb-1">
-              <CheckCircle className="w-5 text-white" />
-              <span className="text-sm text-gray-200">HOME (Training Data)</span>
-            </div>
-            <div className="text-3xl font-bold">{sampleCounts.HOME || 0}</div>
-            <div className="text-xs text-gray-200">samples</div>
-          </div>
-
-          {/* Anomaly Detection Info */}
-          <div className="p-4 rounded-xl bg-gray-700/50 border border-dashed border-gray-500">
-            <div className="flex items-center gap-2 mb-1">
-              <AlertTriangle className="w-5 text-yellow-400" />
-              <span className="text-sm text-gray-300">INTRUDER Detection</span>
-            </div>
-            <div className="text-lg font-semibold text-yellow-400">Auto-Detected</div>
-            <div className="text-xs text-gray-400">via anomaly scoring</div>
-          </div>
-        </div>
-
-        {/* Progress indicator */}
-        <div className="mt-3 pt-3 border-t border-gray-700">
-          <div className="flex items-center justify-between text-sm">
-            <span className="text-gray-400">HOME samples: {sampleCounts.HOME || 0}</span>
-            <span className={`${(sampleCounts.HOME || 0) >= 10 ? 'text-green-400' : 'text-yellow-400'}`}>
-              {(sampleCounts.HOME || 0) >= 10
-                ? '✅ Ready to train anomaly detector!'
-                : `⚠ Need ≥10 HOME samples`}
-            </span>
-          </div>
-        </div>
-      </div>      {/* MANUAL SAVE INFO */}
+      {/* MANUAL SAVE INFO */}
       {validatedEvents.length > 0 && (
         <div className="bg-gradient-to-r from-blue-900/50 to-cyan-900/50 p-4 rounded-xl border border-blue-700 mb-4">
           <div className="flex items-center gap-3">
@@ -1461,6 +1635,81 @@ function Vibrations() {
           </div>
         </div>
       )}
+
+      {/* DUAL DATASET STATUS PANEL */}
+      <div className="bg-gradient-to-r from-indigo-900/50 to-purple-900/50 p-4 rounded-xl border border-indigo-700 mb-6">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Database className="w-5 text-indigo-400" />
+            <span className="font-semibold">📊 Dataset Status ({dualDatasetStatus.total_samples || 0} Total Samples)</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className={`px-2 py-1 rounded text-xs ${modelsStatus[activeModel]?.trained ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+              {modelsStatus[activeModel]?.short_name || 'Model'}: {modelsStatus[activeModel]?.trained ? `✓ ${(modelsStatus[activeModel]?.cv_accuracy || 0).toFixed(1)}%` : '⚠ Not Trained'}
+            </span>
+            <button onClick={fetchStatus} className="p-2 hover:bg-gray-700 rounded-lg transition">
+              <RefreshCw className="w-4" />
+            </button>
+          </div>
+        </div>
+
+        {/* Progress Bar */}
+        <div className="mb-3">
+          <div className="flex justify-between text-sm mb-1">
+            <span className="text-gray-400">Progress: {dualDatasetStatus.total_samples || 0} / {dualDatasetStatus.target_samples}</span>
+            <span className={`font-bold ${dualDatasetStatus.progress_percent >= 100 ? 'text-green-400' : 'text-indigo-400'}`}>
+              {dualDatasetStatus.progress_percent || 0}%
+            </span>
+          </div>
+          <div className="w-full bg-gray-700 rounded-full h-3">
+            <div
+              className={`h-3 rounded-full transition-all duration-500 ${dualDatasetStatus.progress_percent >= 100 ? 'bg-green-500' : 'bg-gradient-to-r from-indigo-500 to-purple-500'}`}
+              style={{ width: `${Math.min(100, dualDatasetStatus.progress_percent || 0)}%` }}
+            />
+          </div>
+        </div>
+
+        {/* Individual Files Grid */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          {(dualDatasetStatus.individual_files || []).map((file, idx) => (
+            <div key={idx} className="p-3 rounded-lg bg-green-600/20 border border-green-500/30">
+              <div className="text-xs text-green-400 mb-1">{file.name}</div>
+              <div className="text-xl font-bold">{file.samples}</div>
+              <div className="text-xs text-gray-400">samples</div>
+            </div>
+          ))}
+          {(dualDatasetStatus.individual_files || []).length === 0 && (
+            <div className="p-3 rounded-lg bg-gray-600/20 border border-gray-500/30 col-span-2">
+              <div className="text-xs text-gray-400 mb-1">No Datasets</div>
+              <div className="text-lg font-bold text-gray-500">0 samples</div>
+              <div className="text-xs text-gray-500">Collect data to start</div>
+            </div>
+          )}
+          <div className="p-3 rounded-lg bg-purple-600/20 border border-purple-500/30">
+            <div className="text-xs text-purple-400 mb-1">Active Model</div>
+            <div className={`text-lg font-bold ${modelsStatus[activeModel]?.trained ? 'text-green-400' : 'text-yellow-400'}`}>
+              {modelsStatus[activeModel]?.trained ? '✅ Ready' : '⏳ Train'}
+            </div>
+            <div className="text-xs text-gray-400">{modelsStatus[activeModel]?.short_name || 'None'}</div>
+          </div>
+          <div className="p-3 rounded-lg bg-orange-600/20 border border-orange-500/30">
+            <div className="text-xs text-orange-400 mb-1">Persons</div>
+            <div className="text-xl font-bold">{(dualDatasetStatus.individual_files || []).length}</div>
+            <div className="text-xs text-gray-400">datasets</div>
+          </div>
+        </div>
+
+        {/* Recommendation */}
+        <div className="mt-3 pt-3 border-t border-indigo-700">
+          <div className="text-sm text-gray-300">
+            {(dualDatasetStatus.total_samples || 0) < 5 && '💡 Collect at least 5 HOME samples to train a model'}
+            {(dualDatasetStatus.total_samples || 0) >= 5 && !modelsStatus[activeModel]?.trained &&
+              <span>💡 Ready to train! <button onClick={handleTrainMLP} className="ml-2 text-purple-400 underline hover:text-purple-300">Click to Train {modelsStatus[activeModel]?.short_name || 'Model'}</button></span>}
+            {modelsStatus[activeModel]?.trained &&
+              `🎯 ${modelsStatus[activeModel]?.short_name || 'Model'} trained with ${(modelsStatus[activeModel]?.cv_accuracy || 0).toFixed(1)}% accuracy. Ready for prediction!`}
+          </div>
+        </div>
+      </div>
 
       {/* CONTROL BUTTONS */}
       <div className="flex flex-wrap gap-3 mb-6">
@@ -1514,134 +1763,30 @@ function Vibrations() {
           Clear
         </button>
 
-        {/* Predict with MLP (Manual) - keep here for quick access */}
-        {mlpModelStatus.trained && (
+        {/* Predict Section with Model Selection */}
+        <div className="flex items-center gap-2">
+          <select
+            value={selectedModel}
+            onChange={(e) => setSelectedModel(e.target.value)}
+            className="bg-gray-700 border border-gray-600 text-white px-3 py-3 rounded-xl focus:outline-none focus:ring-2 focus:ring-cyan-500"
+          >
+            {availableModels.filter(m => m.ready).map(model => (
+              <option key={model.name} value={model.name}>
+                {model.short_name} {model.trained ? `(${(model.cv_accuracy || 0).toFixed(1)}%)` : '(Not Trained)'}
+              </option>
+            ))}
+          </select>
           <button
             onClick={handlePredictMLP}
-            disabled={isPredicting || validatedEvents.length === 0}
+            disabled={isPredicting || validatedEvents.length === 0 || !modelsStatus[selectedModel]?.trained}
             className="bg-gradient-to-r from-cyan-500 to-blue-500 px-5 py-3 rounded-xl flex gap-2 items-center font-semibold disabled:opacity-50 disabled:cursor-not-allowed hover:from-cyan-600 hover:to-blue-600 transition-all shadow-lg shadow-cyan-500/20"
+            title={modelsStatus[selectedModel]?.trained ? `Predict with ${modelsStatus[selectedModel]?.short_name} (${(modelsStatus[selectedModel]?.cv_accuracy || 0).toFixed(1)}% accuracy)` : 'Model not trained'}
           >
             {isPredicting ? <RefreshCw className="animate-spin w-5" /> : <Zap className="w-5" />}
             🔮 Predict
           </button>
-        )}
-      </div>
-
-      {/* DUAL DATASET STATUS PANEL (NEW) */}
-      <div className="bg-gradient-to-r from-indigo-900/50 to-purple-900/50 p-4 rounded-xl border border-indigo-700 mb-6">
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2">
-            <Database className="w-5 text-indigo-400" />
-            <span className="font-semibold">📊 Dual Dataset Status (150 Samples Target)</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className={`px-2 py-1 rounded text-xs ${mlpModelStatus.trained ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
-              MLP: {mlpModelStatus.trained ? `✓ ${mlpModelStatus.accuracy}%` : '⚠ Not Trained'}
-            </span>
-            <button onClick={fetchStatus} className="p-2 hover:bg-gray-700 rounded-lg transition">
-              <RefreshCw className="w-4" />
-            </button>
-          </div>
-        </div>
-
-        {/* Progress Bar */}
-        <div className="mb-3">
-          <div className="flex justify-between text-sm mb-1">
-            <span className="text-gray-400">Progress: {dualDatasetStatus.home_csv?.samples || 0} / {dualDatasetStatus.target_samples}</span>
-            <span className={`font-bold ${dualDatasetStatus.progress_percent >= 100 ? 'text-green-400' : 'text-indigo-400'}`}>
-              {dualDatasetStatus.progress_percent}%
-            </span>
-          </div>
-          <div className="w-full bg-gray-700 rounded-full h-3">
-            <div
-              className={`h-3 rounded-full transition-all duration-500 ${dualDatasetStatus.progress_percent >= 100 ? 'bg-green-500' : 'bg-gradient-to-r from-indigo-500 to-purple-500'}`}
-              style={{ width: `${Math.min(100, dualDatasetStatus.progress_percent)}%` }}
-            />
-          </div>
-        </div>
-
-        {/* Dataset Grid */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <div className="p-3 rounded-lg bg-green-600/20 border border-green-500/30">
-            <div className="text-xs text-green-400 mb-1">HOME.csv</div>
-            <div className="text-xl font-bold">{dualDatasetStatus.home_csv?.samples || 0}</div>
-            <div className="text-xs text-gray-400">samples</div>
-          </div>
-          <div className="p-3 rounded-lg bg-blue-600/20 border border-blue-500/30">
-            <div className="text-xs text-blue-400 mb-1">Persons</div>
-            <div className="text-xl font-bold">{dualDatasetStatus.home_csv?.persons?.length || 0}</div>
-            <div className="text-xs text-gray-400">{(dualDatasetStatus.home_csv?.persons || []).join(', ') || 'None'}</div>
-          </div>
-          <div className="p-3 rounded-lg bg-purple-600/20 border border-purple-500/30">
-            <div className="text-xs text-purple-400 mb-1">MLP Status</div>
-            <div className={`text-lg font-bold ${mlpModelStatus.trained ? 'text-green-400' : 'text-yellow-400'}`}>
-              {mlpModelStatus.trained ? '✅ Ready' : '⏳ Train'}
-            </div>
-            <div className="text-xs text-gray-400">{mlpModelStatus.accuracy ? `${mlpModelStatus.accuracy}% acc` : 'Need 5+ samples'}</div>
-          </div>
-          <div className="p-3 rounded-lg bg-orange-600/20 border border-orange-500/30">
-            <div className="text-xs text-orange-400 mb-1">Target</div>
-            <div className="text-xl font-bold">150</div>
-            <div className="text-xs text-gray-400">→ 92% accuracy</div>
-          </div>
-        </div>
-
-        {/* Recommendation */}
-        <div className="mt-3 pt-3 border-t border-indigo-700">
-          <div className="text-sm text-gray-300">
-            {dualDatasetStatus.home_csv?.samples < 5 && '💡 Collect at least 5 HOME samples to train MLP'}
-            {dualDatasetStatus.home_csv?.samples >= 5 && dualDatasetStatus.home_csv?.samples < 150 && !mlpModelStatus.trained &&
-              `💡 ${150 - (dualDatasetStatus.home_csv?.samples || 0)} more samples recommended. You can train MLP now or continue collecting.`}
-            {dualDatasetStatus.home_csv?.samples >= 5 && !mlpModelStatus.trained &&
-              <button onClick={handleTrainMLP} className="ml-2 text-purple-400 underline hover:text-purple-300">Click to Train MLP</button>}
-            {mlpModelStatus.trained && dualDatasetStatus.home_csv?.samples < 150 &&
-              `✅ MLP trained (${mlpModelStatus.accuracy}%). Collect more samples for better accuracy.`}
-            {mlpModelStatus.trained && dualDatasetStatus.home_csv?.samples >= 150 &&
-              `🎯 Target reached! MLP ready with ${mlpModelStatus.accuracy}% accuracy.`}
-          </div>
         </div>
       </div>
-
-      {/* LIVE PREDICTION MODE - Shows after MLP model is trained */}
-      {mlpModelStatus.trained && (
-        <div className={`mb-6 p-4 rounded-xl border-2 transition-all ${livePredictEnabled
-          ? 'bg-gradient-to-r from-purple-900/50 to-pink-900/50 border-purple-500 shadow-lg shadow-purple-500/20'
-          : 'bg-gray-800/50 border-gray-700'
-          }`}>
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <Play className={`w-6 ${livePredictEnabled ? 'text-purple-400 animate-pulse' : 'text-gray-400'}`} />
-              <div>
-                <div className="font-bold text-lg">🔮 Live MLP Prediction Mode</div>
-                <div className="text-sm text-gray-400">
-                  {livePredictEnabled
-                    ? `✅ Auto-predicting footsteps with MLP (${mlpModelStatus.accuracy}% accuracy)`
-                    : 'Enable to identify footsteps automatically when someone walks'}
-                </div>
-              </div>
-            </div>
-            <button
-              onClick={() => {
-                setLivePredictEnabled(!livePredictEnabled);
-                setPredictionMode(!livePredictEnabled);
-                showToast(livePredictEnabled ? '🔮 Live MLP prediction OFF' : '🔮 Live MLP prediction ON!', 'success');
-              }}
-              className={`px-6 py-3 rounded-xl font-bold transition-all ${livePredictEnabled
-                ? 'bg-red-500 hover:bg-red-600 text-white'
-                : 'bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white shadow-lg'
-                }`}
-            >
-              {livePredictEnabled ? '⏹️ Stop' : '▶️ Start Live Prediction'}
-            </button>
-          </div>
-          {livePredictEnabled && isPredicting && (
-            <div className="mt-3 flex items-center gap-2 text-purple-300">
-              <RefreshCw className="w-4 animate-spin" />
-              <span>🧠 MLP analyzing footstep with prediction rules...</span>
-            </div>
-          )}
-        </div>
-      )}
 
       {/* STATUS BAR */}
       <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700 mb-6">
@@ -2247,13 +2392,44 @@ function Vibrations() {
                             <td className="p-3 text-gray-400">{person.type || (isHome ? 'HOME' : 'UNKNOWN')}</td>
                             <td className="p-3 font-bold">{person.samples}</td>
                             <td className="p-3">
-                              <button
-                                onClick={() => handleDeletePerson(person.name)}
-                                disabled={isDeleting || person.samples === 0}
-                                className="bg-red-500 hover:bg-red-600 px-3 py-1 rounded-full text-sm flex items-center gap-1 disabled:opacity-50 transition"
-                              >
-                                <Trash2 className="w-4" /> Delete
-                              </button>
+                              <div className="flex gap-2 flex-wrap">
+                                <button
+                                  onClick={() => handlePreviewDataset(person.name)}
+                                  disabled={person.samples === 0}
+                                  className="bg-cyan-500 hover:bg-cyan-600 px-3 py-1 rounded-full text-sm flex items-center gap-1 disabled:opacity-50 transition"
+                                  title="View dataset samples and statistics"
+                                >
+                                  <Table className="w-4" /> View Data
+                                </button>
+                                <button
+                                  onClick={() => {
+                                    setVizSource(person.name);
+                                    setVizSampleId(null);
+                                    setShowVisualization(true);
+                                  }}
+                                  disabled={person.samples === 0}
+                                  className="bg-purple-500 hover:bg-purple-600 px-3 py-1 rounded-full text-sm flex items-center gap-1 disabled:opacity-50 transition"
+                                  title="View Signal & Wavelet Visualization"
+                                >
+                                  <Waves className="w-4" /> Visualize
+                                </button>
+                                <button
+                                  onClick={() => handleDownloadIndividualDataset(person.name)}
+                                  disabled={downloadingPerson === person.name || person.samples === 0}
+                                  className="bg-blue-500 hover:bg-blue-600 px-3 py-1 rounded-full text-sm flex items-center gap-1 disabled:opacity-50 transition"
+                                  title="Download this person's dataset as ZIP"
+                                >
+                                  {downloadingPerson === person.name ? <RefreshCw className="w-4 animate-spin" /> : <Download className="w-4" />}
+                                  Download
+                                </button>
+                                <button
+                                  onClick={() => handleDeletePerson(person.name)}
+                                  disabled={isDeleting || person.samples === 0}
+                                  className="bg-red-500 hover:bg-red-600 px-3 py-1 rounded-full text-sm flex items-center gap-1 disabled:opacity-50 transition"
+                                >
+                                  <Trash2 className="w-4" /> Delete
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         );
@@ -2422,6 +2598,176 @@ function Vibrations() {
 
       {/* AUDIO */}
       <audio ref={alarmRef} src="/alarm.mp3" preload="auto" />
+
+      {/* SIGNAL & WAVELET VISUALIZATION MODAL */}
+      <SignalVisualization
+        isOpen={showVisualization}
+        onClose={() => setShowVisualization(false)}
+        initialSource={vizSource}
+        initialSampleId={vizSampleId}
+      />
+
+      {/* DATASET PREVIEW MODAL */}
+      {showDatasetPreview && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 rounded-2xl border border-gray-700 shadow-2xl w-full max-w-5xl max-h-[90vh] overflow-hidden flex flex-col">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between p-4 border-b border-gray-700 bg-gray-800/50">
+              <div className="flex items-center gap-3">
+                <Database className="w-6 text-cyan-400" />
+                <div>
+                  <h2 className="text-xl font-bold">{previewData?.person || 'Loading...'} Dataset</h2>
+                  <p className="text-sm text-gray-400">
+                    {previewData ? `${previewData.total_samples} samples • ${previewData.waveform_count || 0} waveforms` : 'Loading...'}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                {previewData && (
+                  <button
+                    onClick={() => handleDownloadIndividualDataset(previewData.person)}
+                    disabled={downloadingPerson === previewData.person}
+                    className="bg-blue-500 hover:bg-blue-600 px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition disabled:opacity-50"
+                  >
+                    {downloadingPerson === previewData.person ? (
+                      <RefreshCw className="w-4 animate-spin" />
+                    ) : (
+                      <Download className="w-4" />
+                    )}
+                    Download ZIP
+                  </button>
+                )}
+                <button
+                  onClick={() => setShowDatasetPreview(false)}
+                  className="p-2 hover:bg-gray-700 rounded-lg transition text-gray-400 hover:text-white"
+                >
+                  <X className="w-5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Modal Content */}
+            <div className="flex-1 overflow-auto p-4">
+              {previewLoading ? (
+                <div className="flex items-center justify-center h-64">
+                  <RefreshCw className="w-8 h-8 animate-spin text-cyan-400" />
+                  <span className="ml-3 text-gray-400">Loading dataset preview...</span>
+                </div>
+              ) : previewData ? (
+                <div className="space-y-6">
+                  {/* Feature Statistics */}
+                  {previewData.feature_stats && Object.keys(previewData.feature_stats).length > 0 && (
+                    <div className="bg-gray-800/50 rounded-xl p-4 border border-gray-700">
+                      <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
+                        <TrendingUp className="w-5 text-purple-400" />
+                        Feature Statistics (Top 10)
+                      </h3>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="border-b border-gray-700 text-gray-400">
+                              <th className="text-left p-2">Feature</th>
+                              <th className="text-right p-2">Mean</th>
+                              <th className="text-right p-2">Std</th>
+                              <th className="text-right p-2">Min</th>
+                              <th className="text-right p-2">Max</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {Object.entries(previewData.feature_stats).slice(0, 10).map(([feature, stats]) => (
+                              <tr key={feature} className="border-b border-gray-800 hover:bg-gray-700/30">
+                                <td className="p-2 font-medium text-cyan-300">{feature}</td>
+                                <td className="p-2 text-right">{stats?.mean?.toFixed(4) ?? 'N/A'}</td>
+                                <td className="p-2 text-right text-gray-400">{stats?.std?.toFixed(4) ?? 'N/A'}</td>
+                                <td className="p-2 text-right text-green-400">{stats?.min?.toFixed(4) ?? 'N/A'}</td>
+                                <td className="p-2 text-right text-red-400">{stats?.max?.toFixed(4) ?? 'N/A'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Recent Samples Table */}
+                  <div className="bg-gray-800/50 rounded-xl p-4 border border-gray-700">
+                    <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
+                      <Table className="w-5 text-cyan-400" />
+                      Recent Samples ({previewData.samples?.length || 0} of {previewData.total_samples})
+                    </h3>
+                    {previewData.samples && previewData.samples.length > 0 ? (
+                      <div className="overflow-x-auto max-h-80">
+                        <table className="w-full text-sm">
+                          <thead className="sticky top-0 bg-gray-800">
+                            <tr className="border-b border-gray-700 text-gray-400">
+                              <th className="text-left p-2">#</th>
+                              <th className="text-left p-2">Timestamp</th>
+                              <th className="text-right p-2">RMS</th>
+                              <th className="text-right p-2">Energy</th>
+                              <th className="text-right p-2">Dominant Freq</th>
+                              <th className="text-right p-2">Spike Count</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {previewData.samples.map((sample, idx) => (
+                              <tr key={idx} className="border-b border-gray-800/50 hover:bg-gray-700/30">
+                                <td className="p-2 text-gray-500">{sample.sample_index ?? idx}</td>
+                                <td className="p-2 text-gray-300">{sample._timestamp || sample.timestamp || 'N/A'}</td>
+                                <td className="p-2 text-right text-cyan-300">{sample.stat_rms?.toFixed(4) ?? 'N/A'}</td>
+                                <td className="p-2 text-right text-purple-300">{sample.stat_energy?.toFixed(4) ?? 'N/A'}</td>
+                                <td className="p-2 text-right text-yellow-300">{sample.fft_dominant_freq?.toFixed(2) ?? 'N/A'} Hz</td>
+                                <td className="p-2 text-right text-green-300">{sample.spike_count ?? 'N/A'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <div className="text-center text-gray-500 py-8">
+                        No samples available for preview
+                      </div>
+                    )}
+                  </div>
+
+                  {/* File Info */}
+                  {previewData.file_info && (
+                    <div className="bg-gray-800/50 rounded-xl p-4 border border-gray-700">
+                      <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
+                        <Database className="w-5 text-green-400" />
+                        File Information
+                      </h3>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        <div className="bg-gray-700/30 rounded-lg p-3">
+                          <div className="text-xs text-gray-400 mb-1">CSV Path</div>
+                          <div className="font-medium text-sm truncate" title={previewData.file_info.features_csv?.path}>
+                            {previewData.file_info.features_csv?.path?.split('/').pop() || 'N/A'}
+                          </div>
+                        </div>
+                        <div className="bg-gray-700/30 rounded-lg p-3">
+                          <div className="text-xs text-gray-400 mb-1">File Size</div>
+                          <div className="font-medium">{previewData.file_info.features_csv?.size_kb || 0} KB</div>
+                        </div>
+                        <div className="bg-gray-700/30 rounded-lg p-3">
+                          <div className="text-xs text-gray-400 mb-1">Waveforms</div>
+                          <div className="font-medium">{previewData.waveform_count || 0}</div>
+                        </div>
+                        <div className="bg-gray-700/30 rounded-lg p-3">
+                          <div className="text-xs text-gray-400 mb-1">Columns</div>
+                          <div className="font-medium">{previewData.file_info.features_csv?.columns?.length || 0}</div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="text-center text-gray-500 py-8">
+                  No data available
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* TOAST NOTIFICATIONS */}
       <div className="fixed bottom-6 right-6 z-50 flex flex-col gap-2">
