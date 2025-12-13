@@ -9,6 +9,7 @@ import Vibrations from "./pages/Vibrations";
 import Notifications from "./pages/Notifications";
 import FAQs from "./pages/FAQs";
 import About from "./pages/About";
+import Tracking from "./pages/Tracking";
 
 import Login from "./pages/Login.jsx";
 import Signup from "./pages/SignUp.jsx";
@@ -105,6 +106,15 @@ function App() {
               }
             />
 
+            <Route
+              path="/tracking"
+              element={
+                <ProtectedRoute>
+                  <Tracking />
+                </ProtectedRoute>
+              }
+            />
+
             {/* New Sidebar-linked Pages */}
             <Route
               path="/profile"
@@ -119,7 +129,7 @@ function App() {
               path="/settings"
               element={
                 <ProtectedRoute>
-                  <Settings/>
+                  <Settings />
                 </ProtectedRoute>
               }
             />

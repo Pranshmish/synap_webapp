@@ -42,15 +42,15 @@ function Navbar({ darkMode, setDarkMode, setSidebarOpen }) {
               { path: "/notifications", label: "Notifications" },
               { path: "/faqs", label: "FAQs" },
               { path: "/about", label: "About" },
+              { path: "/tracking", label: "Tracking" },
             ].map((item) => (
               <Link
                 key={item.path}
                 to={item.path}
-                className={`px-4 py-2 rounded-lg font-medium transition-all ${
-                  isActive(item.path)
+                className={`px-4 py-2 rounded-lg font-medium transition-all ${isActive(item.path)
                     ? 'bg-blue-600 text-white shadow-lg'
                     : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'
-                }`}
+                  }`}
               >
                 {item.label}
               </Link>

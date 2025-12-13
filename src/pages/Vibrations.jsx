@@ -1398,6 +1398,7 @@ function Vibrations() {
 
   // ============== CHART DATA ==============
   // Build datasets array - base datasets first
+  /* Chart Datasets */
   const chartDatasets = [
     {
       label: "Amplified Signal",
@@ -1407,7 +1408,9 @@ function Vibrations() {
       borderWidth: 1.5,
       pointRadius: 0,
       fill: true,
-      tension: 0.1
+      tension: 0.1,
+      normalized: true,
+      spanGaps: true
     },
     {
       label: "Captured Event",
@@ -1417,7 +1420,9 @@ function Vibrations() {
       borderWidth: 2,
       pointRadius: 0,
       fill: true,
-      tension: 0.1
+      tension: 0.1,
+      normalized: true,
+      spanGaps: true
     }
   ];
 
@@ -1918,7 +1923,7 @@ function Vibrations() {
             <span className="font-semibold">Amplified Vibration Signal</span>
           </div>
           <div className="h-48">
-            <Line data={amplifiedChartData} options={chartOptions} />
+            <Line data={amplifiedChartData} options={chartOptions} key={isConnected ? 'connected' : 'disconnected'} />
           </div>
         </div>
 
