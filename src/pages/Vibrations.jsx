@@ -38,10 +38,12 @@ import {
   User,
   X,
   Waves,
+  Target,
 } from "lucide-react";
 
 // Import SignalVisualization component
 import SignalVisualization from "../components/SignalVisualization";
+import FootstepMap from "../components/FootstepMap";
 
 // Import API and utilities
 import { api, BUFFER_CONFIG } from "../config/api";
@@ -60,6 +62,8 @@ import {
   std,
   computeFFT,
 } from "../utils/signalProcessing";
+import PositionTracker from "../utils/positionTracking";
+import { useEsp32WebSocket } from "../hooks/useEsp32WebSocket";
 
 ChartJS.register(
   LineElement,
@@ -119,7 +123,9 @@ function Vibrations() {
   // Data can be saved as HOME or INTRUDER based on saveAsIntruder toggle
   const [labelName, setLabelName] = useState(""); // Person name (e.g., Apurv, Samir)
   const [saveAsIntruder, setSaveAsIntruder] = useState(false); // Toggle to save as INTRUDER class
-  const [status, setStatus] = useState("Idle — Connect serial to begin");
+  const [status, setStatus] = useState("Idle — Connect serial/wifi to begin");
+  const [connectionMethod, setConnectionMethod] = useState('websocket');
+  const [gatewayIp, setGatewayIp] = useState("192.168.4.1");
   const [prediction, setPrediction] = useState(null);
   const [isConnected, setIsConnected] = useState(false);
   const [sampleCounts, setSampleCounts] = useState({});
@@ -128,6 +134,9 @@ function Vibrations() {
   const [showTrainingDetails, setShowTrainingDetails] = useState(false); // Toggle details panel
   const [selectedDatasets, setSelectedDatasets] = useState([]); // Selected datasets for training
   const [availableDatasets, setAvailableDatasets] = useState([]); // Available datasets from backend
+  const [activeChannels, setActiveChannels] = useState([true, true, true, true]);
+  const activeChannelsRef = useRef([true, true, true, true]);
+
 
   // ============== MULTI-MODEL STATE ==============
   const [selectedModel, setSelectedModel] = useState('MLPClassifier'); // Default model
@@ -171,13 +180,31 @@ function Vibrations() {
     HybridLSTMSNN: { short_name: 'Hybrid', display_name: 'Hybrid LSTM + SNN', trained: false, ready: false }
   });
 
-  // ============== DUAL DATASET STATUS ==============
   const [dualDatasetStatus, setDualDatasetStatus] = useState({
     home_csv: { samples: 0, persons: [] },
     progress_percent: 0,
     target_samples: 150
   });
   const [mlpModelStatus, setMlpModelStatus] = useState({ trained: false, accuracy: 0 });
+
+  const [vibrationGains, setVibrationGains] = useState([
+    DETECTION_CONFIG.GAIN || 50,
+    DETECTION_CONFIG.GAIN || 50,
+    DETECTION_CONFIG.GAIN || 50,
+    DETECTION_CONFIG.GAIN || 50
+  ]);
+  const [adcGates, setAdcGates] = useState([
+    DETECTION_CONFIG.RAW_DELTA_GATE_ADC || 110,
+    DETECTION_CONFIG.RAW_DELTA_GATE_ADC || 110,
+    DETECTION_CONFIG.RAW_DELTA_GATE_ADC || 110,
+    DETECTION_CONFIG.RAW_DELTA_GATE_ADC || 110
+  ]);
+  // No longer using separate sensitivityTrigger, consolidated into customThreshold for all sync logic
+
+  // ============== LIVE MONITOR STATE ==============
+  const [liveRawValues, setLiveRawValues] = useState([2048, 2048, 2048, 2048]);
+  const liveRawValuesRef = useRef([2048, 2048, 2048, 2048]);
+
 
   // ============== LOADING STATES ==============
   const [isSaving, setIsSaving] = useState(false);
@@ -211,6 +238,12 @@ function Vibrations() {
   const [lifData, setLifData] = useState([]);
   const [spikeMarkers, setSpikeMarkers] = useState([]);
   const [captureHighlight, setCaptureHighlight] = useState(null); // {startIdx, endIdx, timestamp} for highlighting captured region
+
+  // ============== MULTI-PIEZO SIGNAL DATA (4 sensors) ==============
+  const [amplifiedDataMulti, setAmplifiedDataMulti] = useState([[], [], [], []]); // Array of 4 piezo data arrays
+  const [lifDataMulti, setLifDataMulti] = useState([[], [], [], []]); // LIF data for each piezo
+  const [spikeMarkersMulti, setSpikeMarkersMulti] = useState([[], [], [], []]); // Spike markers for each piezo
+  const PIEZO_COLORS = ['#00eaff', '#ff6b6b', '#4ade80', '#fbbf24']; // Cyan, Red, Green, Yellow
 
   // ============== EVENT DETECTION STATE ==============
   const [validatedEvents, setValidatedEvents] = useState([]);
@@ -250,6 +283,7 @@ function Vibrations() {
   const portRef = useRef(null);
   const readerRef = useRef(null);
   const readableStreamClosedRef = useRef(null);
+  const wsRef = useRef(null);
   const stopRef = useRef(false);
   const alarmRef = useRef(null);
   const detectorRef = useRef(null);
@@ -263,6 +297,49 @@ function Vibrations() {
   const spikeMarkersRef = useRef([]);  // Stores {time, value}
   const lastStatusUpdateRef = useRef(0);
   const animationFrameRef = useRef(null);
+
+  // ============== MULTI-PIEZO REFS (4 sensors) ==============
+  const detectorsRef = useRef([null, null, null, null]); // Detectors for each piezo
+  const lifNeuronsRef = useRef([null, null, null, null]); // LIF neurons for each piezo
+  const amplifiedDataMultiRef = useRef([[], [], [], []]); // Buffers for each piezo
+  const lifDataMultiRef = useRef([[], [], [], []]);       // LIF buffers for each piezo
+  const spikeMarkersMultiRef = useRef([[], [], [], []]);  // Spike markers for each piezo
+  const manualBuffersMultiRef = useRef([[], [], [], []]); // Manual capture buffers for each piezo
+
+  // Initialize ESP32 WebSocket Hook
+  const {
+    status: wsStatus,
+    isConnected: isWsConnected,
+    toggleConnection: toggleWsConnection,
+    disconnect: disconnectWS
+  } = useEsp32WebSocket(gatewayIp, 81, (data) => {
+    const timestamp = performance.now() / 1000;
+    // Update live values and process samples for all 4 channels
+    [data.ch1, data.ch2, data.ch3, data.ch4].forEach((val, i) => {
+      liveRawValuesRef.current[i] = val;
+      if (activeChannelsRef.current[i]) {
+        processPiezoSample(i, val, timestamp);
+      } else {
+        processPiezoSample(i, 2048, timestamp);
+      }
+    });
+  });
+
+  // Sync status from hook to local status state
+  useEffect(() => {
+    if (connectionMethod === 'websocket') {
+      setStatus(wsStatus);
+    }
+  }, [wsStatus, connectionMethod]);
+
+  const effectiveIsConnected = connectionMethod === 'serial' ? isConnected : isWsConnected;
+
+  // ============== POSITION TRACKING ==============
+  const [currentPosition, setCurrentPosition] = useState(null);
+  const [positionHistory, setPositionHistory] = useState([]);
+  const positionTrackerRef = useRef(null);
+  const recentAmplitudesRef = useRef([[], [], [], []]); // Track recent peaks for position calculation
+  const positionCalculationTimerRef = useRef(null);
 
   // ============== VISUALIZATION LOOP ==============
   // Syncs mutable refs to React state at 60FPS (screen refresh rate) to prevent UI freezing
@@ -282,6 +359,25 @@ function Vibrations() {
         setSpikeMarkers([...spikeMarkersRef.current]);
       }
 
+      // Update multi-piezo data
+      const hasMultiData = amplifiedDataMultiRef.current.some(arr => arr.length > 0);
+      if (hasMultiData) {
+        setAmplifiedDataMulti(amplifiedDataMultiRef.current.map(arr => [...arr]));
+      }
+
+      const hasMultiLifData = lifDataMultiRef.current.some(arr => arr.length > 0);
+      if (hasMultiLifData) {
+        setLifDataMulti(lifDataMultiRef.current.map(arr => [...arr]));
+      }
+
+      const hasMultiSpikes = spikeMarkersMultiRef.current.some(arr => arr.length > 0);
+      if (hasMultiSpikes) {
+        setSpikeMarkersMulti(spikeMarkersMultiRef.current.map(arr => [...arr]));
+      }
+
+      // Update Live Raw Monitor
+      setLiveRawValues([...liveRawValuesRef.current]);
+
       animationFrameRef.current = requestAnimationFrame(updateVisualization);
     };
 
@@ -299,24 +395,36 @@ function Vibrations() {
   useEffect(() => {
     detectorRef.current = new FootstepEventDetector(DETECTION_CONFIG);
     lifNeuronRef.current = new LIFNeuron(0.020, 0.025, 0.010, 200);
+
+    // Initialize detectors and LIF neurons for all 4 piezos
+    for (let i = 0; i < 4; i++) {
+      detectorsRef.current[i] = new FootstepEventDetector(DETECTION_CONFIG);
+      lifNeuronsRef.current[i] = new LIFNeuron(0.020, 0.025, 0.010, 200);
+    }
+
+    // Initialize position tracker (80cm x 60cm surface)
+    positionTrackerRef.current = new PositionTracker(80, 60);
+    positionTrackerRef.current.setThreshold(30); // 30 ADC delta gate for tracking
   }, []);
 
   // ============== SENSITIVITY CHANGE HANDLER ==============
   const handleSensitivityChange = (newSensitivity) => {
     setSensitivity(newSensitivity);
-    if (newSensitivity === 'custom') {
-      // Keep custom threshold - apply to adaptive threshold multiplier
-      if (detectorRef.current) {
-        detectorRef.current.updateConfig({ ADAPTIVE_THRESHOLD_MULT: customThreshold });
-      }
-    } else {
-      const preset = SENSITIVITY_PRESETS[newSensitivity];
-      if (preset && detectorRef.current) {
-        detectorRef.current.updateConfig(preset);
-        setCustomThreshold(preset.ADAPTIVE_THRESHOLD_MULT || 3.2);
-      }
+    const preset = SENSITIVITY_PRESETS[newSensitivity];
+
+    if (newSensitivity !== 'custom' && preset) {
+      const g = preset.GAIN || 50;
+      const ag = preset.RAW_DELTA_GATE_ADC || 110;
+      const t = preset.ADAPTIVE_THRESHOLD_MULT || 6.0;
+
+      // Update all channel arrays to match preset
+      setVibrationGains([g, g, g, g]);
+      setAdcGates([ag, ag, ag, ag]);
+      setCustomThreshold(t);
+      setRawGate(ag); // Keep global legacy gate in sync
+
+      showToast(`🎚️ Sensitivity set to ${newSensitivity} (all channels updated)`, 'success');
     }
-    showToast(`🎚️ Sensitivity set to ${newSensitivity}`, 'success');
   };
 
   const handleCustomThresholdChange = (value) => {
@@ -324,14 +432,7 @@ function Vibrations() {
     if (!isNaN(threshold) && threshold > 0) {
       setCustomThreshold(threshold);
       setSensitivity('custom');
-      if (detectorRef.current) {
-        // Update adaptive threshold multiplier
-        detectorRef.current.updateConfig({
-          ADAPTIVE_THRESHOLD_MULT: threshold,
-          // Very low MIN_RMS - any visible signal should pass
-          MIN_RMS_RAW: Math.max(0.003, Math.min(0.04, 0.01 * threshold))
-        });
-      }
+      // No manual updateConfig here - central useEffect handles it
     }
   };
 
@@ -340,23 +441,39 @@ function Vibrations() {
     const newVal = Math.max(0.1, customThreshold * 0.2);
     setCustomThreshold(newVal);
     setSensitivity('custom');
-    if (detectorRef.current) {
-      detectorRef.current.updateConfig({
-        ADAPTIVE_THRESHOLD_MULT: newVal,
-        MIN_RMS_RAW: Math.max(0.003, Math.min(0.04, 0.01 * newVal))
-      });
-    }
-    showToast(`⬇️ Threshold reduced by 80% → ${newVal.toFixed(2)}x`, 'success');
+    showToast(`⬇️ Threshold reduced by 80% → ${newVal.toFixed(2)}x (all channels)`, 'success');
   };
 
-  // Raw amplitude gate handler
+  // Raw amplitude gate handler for all channels (legacy Support)
   const handleRawGateChange = (value) => {
     const gate = parseInt(value, 10);
     if (!isNaN(gate) && gate >= 0 && gate <= 2048) {
       setRawGate(gate);
-      if (detectorRef.current) {
-        detectorRef.current.updateConfig({ RAW_DELTA_GATE_ADC: gate });
-      }
+      setAdcGates([gate, gate, gate, gate]);
+      // Sync effect handles the rest
+    }
+  };
+
+  // Individual channel tuning handlers
+  const handleChannelGainChange = (channelIdx, value) => {
+    const gain = parseInt(value, 10);
+    if (!isNaN(gain)) {
+      setVibrationGains(prev => {
+        const next = [...prev];
+        next[channelIdx] = gain;
+        return next;
+      });
+    }
+  };
+
+  const handleChannelGateChange = (channelIdx, value) => {
+    const gate = parseInt(value, 10);
+    if (!isNaN(gate)) {
+      setAdcGates(prev => {
+        const next = [...prev];
+        next[channelIdx] = gate;
+        return next;
+      });
     }
   };
 
@@ -461,7 +578,7 @@ function Vibrations() {
       // Force immediate cleanup on unmount
       stopRef.current = true;
       if (readerRef.current) readerRef.current.cancel().catch(() => { });
-      // Note: Full async cleanup can't be guaranteed here, but we set flags
+      if (wsRef.current) wsRef.current.close();
     };
   }, []);
 
@@ -486,10 +603,23 @@ function Vibrations() {
       detectorRef.current?.reset();
       lifNeuronRef.current?.reset();
 
+      // Reset multi-piezo detectors and LIF neurons
+      for (let i = 0; i < 4; i++) {
+        detectorsRef.current[i]?.reset();
+        lifNeuronsRef.current[i]?.reset();
+        amplifiedDataMultiRef.current[i] = [];
+        lifDataMultiRef.current[i] = [];
+        spikeMarkersMultiRef.current[i] = [];
+        manualBuffersMultiRef.current[i] = [];
+      }
+
       setIsConnected(true);
       setAmplifiedData([]);
       setLifData([]);
       setSpikeMarkers([]);
+      setAmplifiedDataMulti([[], [], [], []]);
+      setLifDataMulti([[], [], [], []]);
+      setSpikeMarkersMulti([[], [], [], []]);
       setValidatedEvents([]);
       setDetectionStats({ totalSamples: 0, eventsDetected: 0, noiseRejected: 0, lastRejectionReason: null });
 
@@ -542,6 +672,57 @@ function Vibrations() {
     setStatus("🔌 Disconnected");
   };
 
+  // ============== WEBSOCKET CONNECTION ==============
+  const connectWebSocket = () => {
+    toggleWsConnection();
+  };
+
+  const disconnectWebSocket = () => {
+    disconnectWS();
+  };
+
+  // ============== SYNC TUNING TO DETECTORS ==============
+  useEffect(() => {
+    // Determine dynamic MIN_RMS based on threshold
+    const dynamicMinRms = Math.max(0.003, Math.min(0.04, 0.01 * customThreshold));
+
+    // Update global config (for new detectors added later)
+    DETECTION_CONFIG.GAIN = vibrationGains[0];
+    DETECTION_CONFIG.RAW_DELTA_GATE_ADC = adcGates[0];
+    DETECTION_CONFIG.ADAPTIVE_THRESHOLD_MULT = customThreshold;
+    DETECTION_CONFIG.MIN_RMS_RAW = dynamicMinRms;
+
+    // Update active primary detector (P0)
+    if (detectorRef.current) {
+      detectorRef.current.updateConfig({
+        GAIN: vibrationGains[0],
+        RAW_DELTA_GATE_ADC: adcGates[0],
+        ADAPTIVE_THRESHOLD_MULT: customThreshold,
+        MIN_RMS_RAW: dynamicMinRms
+      });
+    }
+
+    // Update all multi-piezo detectors with their specific config
+    for (let i = 0; i < 4; i++) {
+      if (detectorsRef.current[i]) {
+        detectorsRef.current[i].updateConfig({
+          GAIN: vibrationGains[i],
+          RAW_DELTA_GATE_ADC: adcGates[i],
+          ADAPTIVE_THRESHOLD_MULT: customThreshold,
+          MIN_RMS_RAW: dynamicMinRms
+        });
+      }
+    }
+  }, [vibrationGains, adcGates, customThreshold]);
+
+  const resetAllDetectors = () => {
+    detectorRef.current?.reset();
+    for (let i = 0; i < 4; i++) {
+      detectorsRef.current[i]?.reset();
+    }
+    showToast("🔄 Sensors Recalibrated", "success");
+  };
+
   // ============== SERIAL: READ LOOP ==============
   const readLoop = async (reader) => {
     while (!stopRef.current) {
@@ -570,58 +751,266 @@ function Vibrations() {
   const processSerialLine = (line) => {
     if (!line) return;
 
+    const timestamp = performance.now() / 1000;
+
+    // ============== CH1/CH2/CH3/CH4 FORMAT PARSING ==============
+    // Format: CH1:0.1 CH2:0.0 CH3:0.1 CH4:0.0
+    // Map CH1→P0, CH2→P1, CH3→P2, CH4→P3
+    const channelPattern = /CH(\d+)\s*:\s*([\d.]+)/gi;
+    const channelMatches = [...line.matchAll(channelPattern)];
+
+    if (channelMatches.length > 0) {
+      for (const match of channelMatches) {
+        const channelNum = parseInt(match[1], 10);
+        const value = parseFloat(match[2]);
+        const piezoIndex = channelNum - 1;
+
+        if (piezoIndex >= 0 && piezoIndex < 4 && !isNaN(value)) {
+          const rawValue = Math.round(value);
+
+          // Update Live Monitor (Ref only, state updated in loop)
+          liveRawValuesRef.current[piezoIndex] = rawValue;
+
+          // Diagnostic logging for troublesome channels 2 & 3
+          if (piezoIndex >= 2 && rawValue !== 2048) {
+            console.log(`📶 Data received for Channel ${piezoIndex}: ${rawValue}`);
+          }
+
+          // If inactive, force to 2048 (Baseline)
+          if (!activeChannelsRef.current[piezoIndex]) {
+            processPiezoSample(piezoIndex, 2048, timestamp);
+          } else {
+            processPiezoSample(piezoIndex, rawValue, timestamp);
+          }
+        }
+      }
+      return;
+    }
+
+    // ============== MULTI-PIEZO PARSING (Raw0/Raw1 format) ==============
+    // Format: Raw0:<value> Raw1:<value> Raw2:<value> Raw3:<value>
+    const multiPiezoPattern = /Raw(\d)\s*[:=]?\s*(\d{1,4})/gi;
+    const multiMatches = [...line.matchAll(multiPiezoPattern)];
+
+    if (multiMatches.length > 0) {
+      // Debug: Log which channels are being updated
+      const channelsDetected = multiMatches.map(m => `P${m[1]}:${m[2]}`).join(', ');
+      console.log(`Multi-piezo data: ${channelsDetected}`);
+
+      // Process each piezo sensor found in the line
+      for (const match of multiMatches) {
+        const piezoIndex = parseInt(match[1], 10);
+        const rawValue = parseInt(match[2], 10);
+
+        if (piezoIndex >= 0 && piezoIndex < 4 && !isNaN(rawValue) && rawValue >= 0 && rawValue <= 4095) {
+          // Update Live Monitor (Crucial: was missing in Raw format)
+          liveRawValuesRef.current[piezoIndex] = rawValue;
+
+          if (piezoIndex >= 2 && rawValue !== 2048) {
+            console.log(`📶 Raw data received for Channel ${piezoIndex}: ${rawValue}`);
+          }
+
+          // Check Active Channel
+          if (!activeChannelsRef.current[piezoIndex]) {
+            processPiezoSample(piezoIndex, 2048, timestamp);
+          } else {
+            processPiezoSample(piezoIndex, rawValue, timestamp);
+          }
+        }
+      }
+      return; // Multi-piezo line processed
+    }
+
+    // ============== SINGLE-PIEZO FALLBACK (Original Logic) ==============
+    // This only processes for Piezo 0 - will NOT affect other channels
     // Parse ESP32 formats robustly
     let rawValue;
-    const rawMatch = line.match(/Raw\s*[:=]?\s*(\d{1,4})/i);
+    // Match "Raw:" (without digit) for backward compatibility
+    const rawMatch = line.match(/\bRaw\s*[:=]?\s*(\d{1,4})/i);
     if (rawMatch) {
       rawValue = parseInt(rawMatch[1], 10);
+      console.log(`Single-piezo data (P0): ${rawValue} from line: "${line}"`);
     } else {
       const anyNum = line.match(/\b(\d{1,4})\b/);
-      rawValue = anyNum ? parseInt(anyNum[1], 10) : NaN;
+      if (anyNum) {
+        rawValue = parseInt(anyNum[1], 10);
+        // Only log if it's a meaningful value (not just 0 or 1)
+        if (rawValue > 10) {
+          console.log(`Fallback numeric data (P0): ${rawValue} from line: "${line}"`);
+        }
+      } else {
+        rawValue = NaN;
+      }
     }
 
     if (isNaN(rawValue) || rawValue < 0 || rawValue > 4095) return;
 
-    const detector = detectorRef.current;
+    // Process as Piezo 0 ONLY for backward compatibility
+    // This will NOT affect channels 1-3
+    processPiezoSample(0, rawValue, timestamp);
+  };
+
+  // ============== CALCULATE FOOTSTEP POSITION ==============
+  const calculateFootstepPosition = () => {
+    if (!positionTrackerRef.current) return;
+
+    // Get peak amplitude from each channel in the last 100ms
+    const peakAmplitudes = recentAmplitudesRef.current.map(channelData => {
+      if (channelData.length === 0) return 0;
+      return Math.max(...channelData.map(d => d.amplitude));
+    });
+
+    // Calculate position using the tracker
+    const position = positionTrackerRef.current.calculatePosition(peakAmplitudes);
+
+    if (position && position.confidence > 0.3) {
+      // Update current position
+      setCurrentPosition(position);
+
+      // Update history
+      setPositionHistory(prev => {
+        const updated = [...prev, position];
+        return updated.slice(-20); // Keep last 20 positions
+      });
+
+      console.log(`📍 Footstep detected at (${position.x}, ${position.y}) cm - Confidence: ${position.confidence.toFixed(1)}/10`);
+    }
+  };
+
+  // ============== PROCESS SINGLE PIEZO SAMPLE ==============
+  const processPiezoSample = (piezoIndex, rawValue, timestamp) => {
+    // Use piezo-specific detector or fall back to main detector for piezo 0
+    const detector = piezoIndex === 0 ? detectorRef.current : detectorsRef.current[piezoIndex];
     if (!detector) return;
 
     const result = detector.processSample(rawValue);
-    const timestamp = performance.now() / 1000;
 
-    // 1. Update Detection Stats - throttle to reduce renders
-    // Simple counter updates are cheap, but doing it 200/sec is still wasteful.
-    // We'll let React batching handle this for now as it's just a counter.
-    setDetectionStats(prev => ({
-      ...prev,
-      totalSamples: prev.totalSamples + 1
-    }));
+    // Update detection stats (only for piezo 0 to avoid counting 4x)
+    if (piezoIndex === 0) {
+      setDetectionStats(prev => ({
+        ...prev,
+        totalSamples: prev.totalSamples + 1
+      }));
+    }
 
-    // 2. Buffer Raw Data for Manual Capture
-    manualBufferRef.current.push(rawValue);
-    if (manualBufferRef.current.length > 100) manualBufferRef.current.shift();
+    // Buffer Raw Data for Manual Capture
+    if (piezoIndex === 0) {
+      manualBufferRef.current.push(rawValue);
+      if (manualBufferRef.current.length > 100) manualBufferRef.current.shift();
+    }
+    manualBuffersMultiRef.current[piezoIndex].push(rawValue);
+    if (manualBuffersMultiRef.current[piezoIndex].length > 100) manualBuffersMultiRef.current[piezoIndex].shift();
 
-    // 3. Update Visualization Buffers (Mutable Refs) instead of State
-    amplifiedDataRef.current.push({ time: timestamp, value: result.filtered });
-    if (amplifiedDataRef.current.length > 500) amplifiedDataRef.current.shift();
+    // Update Visualization Buffers
+    if (piezoIndex === 0) {
+      amplifiedDataRef.current.push({ time: timestamp, value: result.filtered });
+      if (amplifiedDataRef.current.length > 500) amplifiedDataRef.current.shift();
+    }
+    amplifiedDataMultiRef.current[piezoIndex].push({ time: timestamp, value: result.filtered });
+    if (amplifiedDataMultiRef.current[piezoIndex].length > 500) amplifiedDataMultiRef.current[piezoIndex].shift();
 
-    // ============== SAVE ALL VISIBLE MODE ==============
-    // Captures everything that passes noise filter (rawGate ADC & spikeThreshold)
-    if (saveAllVisibleMode && !result.isWarmup) {
-      const rawDelta = Math.abs(rawValue - (detector.baselineMean || 2048));
-      const filteredAbs = Math.abs(result.filtered);
+    // LIF Neuron Processing
+    const lif = piezoIndex === 0 ? lifNeuronRef.current : lifNeuronsRef.current[piezoIndex];
+    if (lif && !result.isWarmup) {
+      const normalizedInput = Math.abs(result.filtered) / 500;
+      const lifResult = lif.step(normalizedInput);
 
-      // If signal passes both filters, add to visible buffer
-      if (rawDelta >= rawGate && filteredAbs >= spikeThreshold) {
-        visibleBufferRef.current.push(rawValue);
-      } else if (visibleBufferRef.current.length > 0) {
-        // Signal dropped - check if we have enough to save
+      if (piezoIndex === 0) {
+        lifDataRef.current.push({ time: timestamp, membrane: lifResult.membrane });
+        if (lifDataRef.current.length > 500) lifDataRef.current.shift();
+
+        if (lifResult.spiked) {
+          spikeMarkersRef.current.push({ time: timestamp, value: lifResult.membrane });
+          if (spikeMarkersRef.current.length > 50) spikeMarkersRef.current.shift();
+        }
+      }
+
+      lifDataMultiRef.current[piezoIndex].push({ time: timestamp, membrane: lifResult.membrane });
+      if (lifDataMultiRef.current[piezoIndex].length > 500) lifDataMultiRef.current[piezoIndex].shift();
+
+      if (lifResult.spiked) {
+        spikeMarkersMultiRef.current[piezoIndex].push({ time: timestamp, value: lifResult.membrane });
+        if (spikeMarkersMultiRef.current[piezoIndex].length > 50) spikeMarkersMultiRef.current[piezoIndex].shift();
+      }
+    }
+
+    // ============== POSITION TRACKING ==============
+    // Track UN-AMPLIFIED amplitude peaks for position calculation (removes gain bias)
+    const rawFiltered = Math.abs(result.filtered) / (detector.config.GAIN || 1);
+    recentAmplitudesRef.current[piezoIndex].push({ time: timestamp, amplitude: rawFiltered });
+
+    // Keep only last 100ms of data
+    const cutoffTime = timestamp - 0.1; // 100ms ago
+    recentAmplitudesRef.current[piezoIndex] = recentAmplitudesRef.current[piezoIndex].filter(
+      a => a.time > cutoffTime
+    );
+
+    // Trigger position calculation on detector activity (Gain-Independent)
+    // If signal is 150% of adaptive threshold, it's a valid tracking point
+    if (result.energy > result.threshold * 1.5 && !result.isWarmup) {
+      // Clear any pending calculation
+      if (positionCalculationTimerRef.current) {
+        clearTimeout(positionCalculationTimerRef.current);
+      }
+
+      // Wait 50ms to collect amplitudes from all channels
+      positionCalculationTimerRef.current = setTimeout(() => {
+        calculateFootstepPosition();
+      }, 50);
+    }
+
+    // Status Updates and Event Handling only for Piezo 0 (to avoid spam)
+    if (piezoIndex === 0) {
+      const now = Date.now();
+      if (now - lastStatusUpdateRef.current > 200) {
+        if (result.isWarmup) {
+          const progress = result.warmupProgress ? (result.warmupProgress * 100).toFixed(0) : '...';
+          setStatus(`🔄 Warming up noise floor... ${progress}%`);
+        } else if (result.eventActive) {
+          setStatus(`📊 Capturing: ${result.eventLength} samples`);
+          setCurrentEventInfo({ length: result.eventLength, energy: result.energy, threshold: result.threshold, noiseFloor: result.noiseFloor });
+        } else {
+          setCurrentEventInfo(null);
+          if (!result.event) {
+            const energyRatio = result.energy / Math.max(result.threshold, 0.001);
+            setStatus(`🟢 Noise: ${result.noiseFloor?.toFixed(4) || '?'} | Thresh: ${result.threshold?.toFixed(4) || '?'} | Energy: ${result.energy?.toFixed(4) || '?'} (${(energyRatio * 100).toFixed(0)}%)`);
+          }
+        }
+        lastStatusUpdateRef.current = now;
+      }
+
+      // Handle detected event (only for piezo 0)
+      if (result.event && !manualCaptureMode) {
+        if (result.event.isNoise || result.event.rejected) {
+          setDetectionStats(prev => ({
+            ...prev,
+            noiseRejected: (prev.noiseRejected || 0) + 1
+          }));
+          console.log('❌ Noise rejected:', result.event.reasons);
+          setStatus(`🔇 Noise rejected: ${result.event.reasons?.[0] || 'Invalid pattern'}`);
+        } else {
+          handleValidatedEvent(result.event);
+        }
+      }
+    }
+  };
+
+  // ============== SAVE ALL VISIBLE MODE ==============
+  // Note: This mode uses only Piezo 0 for backward compatibility
+  useEffect(() => {
+    if (!saveAllVisibleMode) return;
+
+    const checkVisibleCapture = () => {
+      const detector = detectorRef.current;
+      if (!detector) return;
+
+      const visibleBuffer = visibleBufferRef.current;
+      if (visibleBuffer.length >= 20) {
         const now = Date.now();
-        if (visibleBufferRef.current.length >= 20 && (now - lastVisibleSaveRef.current) > 500) {
-          // Create event from visible buffer
-          const capturedSamples = [...visibleBufferRef.current];
+        if ((now - lastVisibleSaveRef.current) > 500) {
+          const capturedSamples = [...visibleBuffer];
           const centered = capturedSamples.map(v => v - (detector.baselineMean || 2048));
 
-          // Compute LIF for auto-captured event
           const lifParams = { tau: 0.020, threshold: 0.025, refractory: 0.010, rate: 200 };
           const tempLif = new LIFNeuron(lifParams.tau, lifParams.threshold, lifParams.refractory, lifParams.rate);
           const lifMembrane = [];
@@ -643,11 +1032,9 @@ function Vibrations() {
               peakDev: Math.max(...capturedSamples.map(v => Math.abs(v - (detector.baselineMean || 2048)))),
               samples: capturedSamples.length
             },
-            // Add LIF Data
             lifMembrane: lifMembrane,
             lifSpikes: lifSpikes,
             lifTime: capturedSamples.map((_, i) => i / 200),
-
             baselineMean: detector.baselineMean || 2048,
             noiseFloor: detector.noiseFloor || 0.02,
             timestamp: now,
@@ -655,7 +1042,6 @@ function Vibrations() {
             visibleCapture: true
           };
 
-          // Add to validated events
           setValidatedEvents(prev => {
             const updated = [...prev, visibleEvent];
             console.log(`📊 Visible capture! ${capturedSamples.length} samples, Total: ${updated.length}`);
@@ -669,64 +1055,14 @@ function Vibrations() {
 
           lastVisibleSaveRef.current = now;
           setStatus(`📊 Auto-captured ${capturedSamples.length} samples (visible activity)`);
-        }
-        // Clear buffer for next capture
-        visibleBufferRef.current = [];
-      }
-    }
-
-    // 5. LIF Neuron Processing
-    const lif = lifNeuronRef.current;
-    if (lif && !result.isWarmup) {
-      const normalizedInput = Math.abs(result.filtered) / 500;
-      const lifResult = lif.step(normalizedInput);
-
-      lifDataRef.current.push({ time: timestamp, membrane: lifResult.membrane });
-      if (lifDataRef.current.length > 500) lifDataRef.current.shift();
-
-      if (lifResult.spiked) {
-        spikeMarkersRef.current.push({ time: timestamp, value: lifResult.membrane });
-        if (spikeMarkersRef.current.length > 50) spikeMarkersRef.current.shift();
-      }
-    }
-
-    // 6. Status Updates (Throttled)
-    const now = Date.now();
-    if (now - lastStatusUpdateRef.current > 200) { // Update status max 5 times/sec
-      if (result.isWarmup) {
-        const progress = result.warmupProgress ? (result.warmupProgress * 100).toFixed(0) : '...';
-        setStatus(`🔄 Warming up noise floor... ${progress}%`);
-      } else if (result.eventActive) {
-        setStatus(`📊 Capturing: ${result.eventLength} samples`);
-        setCurrentEventInfo({ length: result.eventLength, energy: result.energy, threshold: result.threshold, noiseFloor: result.noiseFloor });
-      } else {
-        setCurrentEventInfo(null);
-        if (!result.event) {
-          // Show energy-based status with noise floor
-          const energyRatio = result.energy / Math.max(result.threshold, 0.001);
-          setStatus(`🟢 Noise: ${result.noiseFloor?.toFixed(4) || '?'} | Thresh: ${result.threshold?.toFixed(4) || '?'} | Energy: ${result.energy?.toFixed(4) || '?'} (${(energyRatio * 100).toFixed(0)}%)`);
+          visibleBufferRef.current = [];
         }
       }
-      lastStatusUpdateRef.current = now;
-    }
+    };
 
-    // Handle detected event (could be valid footstep or rejected noise)
-    // Skip if in manual capture mode
-    if (result.event && !manualCaptureMode) {
-      if (result.event.isNoise || result.event.rejected) {
-        // Noise event rejected - do not save, just log
-        setDetectionStats(prev => ({
-          ...prev,
-          noiseRejected: (prev.noiseRejected || 0) + 1
-        }));
-        console.log('❌ Noise rejected:', result.event.reasons);
-        setStatus(`🔇 Noise rejected: ${result.event.reasons?.[0] || 'Invalid pattern'}`);
-      } else {
-        // Valid footstep
-        handleValidatedEvent(result.event);
-      }
-    }
-  };
+    const interval = setInterval(checkVisibleCapture, 100);
+    return () => clearInterval(interval);
+  }, [saveAllVisibleMode]);
 
   // ============== MANUAL CAPTURE ==============
   const handleManualCapture = () => {
@@ -1451,6 +1787,131 @@ function Vibrations() {
     datasets: chartDatasets
   };
 
+  // ============== MULTI-PIEZO CHART DATA (4 sensors overlaid) ==============
+  // Get time labels from longest piezo data array
+  const maxLengthPiezo = amplifiedDataMulti.reduce((max, arr, idx) =>
+    arr.length > amplifiedDataMulti[max].length ? idx : max, 0);
+  const multiTimeLabels = amplifiedDataMulti[maxLengthPiezo].map(d => d.time.toFixed(2));
+
+  const multiPiezoChartData = {
+    labels: multiTimeLabels,
+    datasets: [
+      {
+        label: "Piezo 0",
+        data: amplifiedDataMulti[0].map(d => d.value),
+        borderColor: PIEZO_COLORS[0],
+        backgroundColor: `${PIEZO_COLORS[0]}25`,
+        borderWidth: 1.5,
+        pointRadius: 0,
+        fill: false,
+        tension: 0.1
+      },
+      {
+        label: "Piezo 1",
+        data: amplifiedDataMulti[1].map(d => d.value),
+        borderColor: PIEZO_COLORS[1],
+        backgroundColor: `${PIEZO_COLORS[1]}25`,
+        borderWidth: 1.5,
+        pointRadius: 0,
+        fill: false,
+        tension: 0.1
+      },
+      {
+        label: "Piezo 2",
+        data: amplifiedDataMulti[2].map(d => d.value),
+        borderColor: PIEZO_COLORS[2],
+        backgroundColor: `${PIEZO_COLORS[2]}25`,
+        borderWidth: 1.5,
+        pointRadius: 0,
+        fill: false,
+        tension: 0.1
+      },
+      {
+        label: "Piezo 3",
+        data: amplifiedDataMulti[3].map(d => d.value),
+        borderColor: PIEZO_COLORS[3],
+        backgroundColor: `${PIEZO_COLORS[3]}25`,
+        borderWidth: 1.5,
+        pointRadius: 0,
+        fill: false,
+        tension: 0.1
+      }
+    ]
+  };
+
+  // Add manual capture highlight if active (to Piezo 0)
+  if (captureHighlight) {
+    multiPiezoChartData.datasets.push({
+      label: `📸 Captured (${captureHighlight.samples} samples)`,
+      data: amplifiedDataMulti[0].map((d, idx) => {
+        if (idx >= captureHighlight.startIdx && idx < captureHighlight.endIdx) {
+          return d.value;
+        }
+        return null;
+      }),
+      borderColor: "#fbbf24",
+      backgroundColor: "rgba(251, 191, 36, 0.4)",
+      borderWidth: 3,
+      pointRadius: 0,
+      fill: true,
+      tension: 0.1,
+      order: -1
+    });
+  }
+
+  // Multi-piezo LIF chart data
+  const multiLifTimeLabels = lifDataMulti[maxLengthPiezo].map(d => d.time.toFixed(2));
+  const multiLifChartData = {
+    labels: multiLifTimeLabels,
+    datasets: [
+      ...lifDataMulti.map((data, idx) => ({
+        label: `Piezo ${idx} Membrane`,
+        data: data.map(d => d.membrane),
+        borderColor: PIEZO_COLORS[idx],
+        backgroundColor: `${PIEZO_COLORS[idx]}15`,
+        borderWidth: 1.5,
+        pointRadius: 0,
+        fill: false,
+        tension: 0.1
+      })),
+      {
+        label: "Threshold",
+        data: multiLifTimeLabels.map(() => 0.025),
+        borderColor: "#ef4444",
+        borderWidth: 1,
+        borderDash: [5, 5],
+        pointRadius: 0,
+        fill: false
+      }
+    ]
+  };
+
+  // Chart options for multi-piezo (with legend)
+  const multiPiezoChartOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: { duration: 0 },
+    scales: {
+      x: { display: false },
+      y: {
+        grid: { color: 'rgba(255,255,255,0.1)' },
+        ticks: { color: '#9ca3af' }
+      }
+    },
+    plugins: {
+      legend: {
+        display: true,
+        position: 'top',
+        labels: {
+          color: '#9ca3af',
+          usePointStyle: true,
+          pointStyle: 'line',
+          boxWidth: 30
+        }
+      }
+    }
+  };
+
   const fftChartData = {
     labels: fftData.frequencies.map(f => f.toFixed(0)),
     datasets: [{
@@ -1494,304 +1955,261 @@ function Vibrations() {
         <h1 className="text-2xl md:text-3xl font-bold flex gap-2 items-center">
           <Activity className="text-cyan-400" /> SynapSense Anomaly Detector
         </h1>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-4">
+          {/* Connection Method Toggle */}
+          <div className="flex bg-gray-900 rounded-lg p-1 border border-gray-700">
+            <button
+              onClick={() => setConnectionMethod('serial')}
+              className={`px-3 py-1 text-[10px] font-black uppercase tracking-tighter rounded-md transition-all ${connectionMethod === 'serial' ? 'bg-cyan-600 text-white' : 'text-gray-500 hover:text-gray-300'}`}
+            >
+              Serial
+            </button>
+            <button
+              onClick={() => setConnectionMethod('websocket')}
+              className={`px-3 py-1 text-[10px] font-black uppercase tracking-tighter rounded-md transition-all ${connectionMethod === 'websocket' ? 'bg-purple-600 text-white' : 'text-gray-500 hover:text-gray-300'}`}
+            >
+              WiFi (WS)
+            </button>
+          </div>
+
           <span className={`px-3 py-1 rounded-full text-sm ${isConnected ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
             {isConnected ? '🟢 Connected' : '🔴 Disconnected'}
           </span>
         </div>
       </div>
 
-      {/* SAVE LABEL SELECTOR + SETTINGS */}
+      {/* SAVE LABEL SELECTOR (HIDDEN FOR TRACKING MODE) */}
+      {/* 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-        {/* PERSON NAME INPUT + CLASS SELECTOR */}
-        <div className={`bg-gray-800/50 p-4 rounded-xl border ${labelName.trim() ? (saveAsIntruder ? 'border-red-600' : 'border-green-600') : 'border-yellow-600'}`}>
-          <label className="block text-sm text-gray-400 mb-2 font-semibold">
-            👤 Person Name for Dataset: <span className="text-red-400">*</span>
-          </label>
-          <div className="flex gap-2 mb-2">
-            <input
-              type="text"
-              value={labelName}
-              onChange={(e) => setLabelName(e.target.value)}
-              placeholder="Enter name (required)..."
-              className={`flex-1 text-white bg-gray-700 p-3 rounded-lg border focus:outline-none ${labelName.trim() ? (saveAsIntruder ? 'border-red-600 focus:border-red-500' : 'border-green-600 focus:border-green-500') : 'border-yellow-600 focus:border-yellow-500'
-                }`}
-              onKeyPress={(e) => e.key === 'Enter' && labelName.trim() && showToast(`✅ Label: ${getEffectiveLabel()}`, 'success')}
-            />
-            <button
-              onClick={() => labelName.trim() ? showToast(`✅ Label: ${getEffectiveLabel()}`, 'success') : showToast('⚠️ Enter a name first!', 'warning')}
-              className="px-4 py-2 bg-cyan-600 hover:bg-cyan-700 rounded-lg font-bold transition-all"
-            >
-              Set
-            </button>
-          </div>
-
-          {/* HOME/INTRUDER Toggle */}
-          <div className="flex items-center gap-4 mb-2 mt-3 p-2 bg-gray-900/50 rounded-lg">
-            <span className="text-sm text-gray-400">Save as:</span>
-            <button
-              onClick={() => setSaveAsIntruder(false)}
-              className={`px-4 py-2 rounded-lg font-semibold transition-all ${!saveAsIntruder
-                ? 'bg-green-600 text-white shadow-lg shadow-green-500/30'
-                : 'bg-gray-700 text-gray-400 hover:bg-gray-600'
-                }`}
-            >
-              🏠 HOME
-            </button>
-            <button
-              onClick={() => setSaveAsIntruder(true)}
-              className={`px-4 py-2 rounded-lg font-semibold transition-all ${saveAsIntruder
-                ? 'bg-red-600 text-white shadow-lg shadow-red-500/30'
-                : 'bg-gray-700 text-gray-400 hover:bg-gray-600'
-                }`}
-            >
-              🚨 INTRUDER
-            </button>
-          </div>
-
-          <p className="text-xs text-gray-500">
-            {labelName.trim()
-              ? <>Saving as: <strong className={`text-base ${saveAsIntruder ? 'text-red-400' : 'text-green-400'}`}>{getEffectiveLabel()}</strong></>
-              : <span className="text-yellow-400">⚠️ Name required to save samples</span>
-            }
-            <span className="ml-2 text-gray-600">• {saveAsIntruder ? 'Training INTRUDER detection' : 'Training HOME recognition'}</span>
-          </p>
-        </div>
-
-        <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700">
-          <label className="block text-sm text-gray-400 mb-2">Capture Mode:</label>
-          <div className="flex flex-col gap-2">
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={manualCaptureMode}
-                onChange={(e) => {
-                  setManualCaptureMode(e.target.checked);
-                  if (e.target.checked) setSaveAllVisibleMode(false);
-                }}
-                className="w-5 h-5 rounded bg-gray-700 border-gray-600"
-              />
-              <span className="text-sm font-semibold">📸 Manual Capture Mode</span>
-            </label>
-
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={saveAllVisibleMode}
-                onChange={(e) => {
-                  setSaveAllVisibleMode(e.target.checked);
-                  if (e.target.checked) setManualCaptureMode(false);
-                  visibleBufferRef.current = [];
-                  showToast(e.target.checked ? '📊 Capturing all visible activity!' : '📊 Visible capture OFF', 'success');
-                }}
-                className="w-5 h-5 rounded bg-gray-700 border-gray-600"
-              />
-              <span className={`text-sm font-semibold ${saveAllVisibleMode ? 'text-cyan-400' : ''}`}>📊 Save All Visible (No Detection)</span>
-            </label>
-
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={autoSaveEnabled}
-                onChange={(e) => setAutoSaveEnabled(e.target.checked)}
-                className="w-5 h-5 rounded bg-gray-700 border-gray-600"
-              />
-              <span className="text-sm font-semibold text-green-400">💾 Auto Save Events</span>
-            </label>
-          </div>
-
-          {/* Spike Threshold Slider for Save All Visible */}
-          {saveAllVisibleMode && (
-            <div className="mt-3 pt-3 border-t border-gray-600">
-              <label className="block text-xs text-cyan-400 mb-1">Spike Threshold: {spikeThreshold.toFixed(1)}</label>
-              <input
-                type="range"
-                min="0.1"
-                max="2.0"
-                step="0.1"
-                value={spikeThreshold}
-                onChange={(e) => setSpikeThreshold(parseFloat(e.target.value))}
-                className="w-full accent-cyan-500"
-              />
-              <div className="text-xs text-gray-500 mt-1">ADC Gate: {rawGate} | Spike: ≥{spikeThreshold}</div>
-            </div>
-          )}
-
-          <p className="text-xs text-gray-500 mt-2">
-            {saveAllVisibleMode
-              ? `📊 Auto-capturing everything ≥${rawGate} ADC & ≥${spikeThreshold} filtered`
-              : manualCaptureMode
-                ? '📸 Click "Capture Now" when you see activity on the graph'
-                : '🤖 Automatic threshold detection enabled'}
-          </p>
-        </div>
+        <Person Name Input hidden>
+        <Home/Intruder Toggle hidden>
       </div>
-
-      {/* MANUAL SAVE INFO */}
+      */}
+      {/* 
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+        <Person Name Input hidden>
+        <Home/Intruder Toggle hidden>
+      </div>
+      */}
+      {/* MANUAL SAVE INFO (HIDDEN) */}
+      {/* 
       {validatedEvents.length > 0 && (
-        <div className="bg-gradient-to-r from-blue-900/50 to-cyan-900/50 p-4 rounded-xl border border-blue-700 mb-4">
-          <div className="flex items-center gap-3">
-            <Database className="w-6 text-cyan-400" />
-            <div className="flex-1">
-              <div className="font-bold text-lg">{validatedEvents.length} events collected</div>
-              <div className="text-sm text-gray-300">Click "💾 Save Events" to store them as "{getEffectiveLabel()}"</div>
+          <div className="bg-gradient-to-r from-blue-900/50 to-cyan-900/50 p-4 rounded-xl border border-blue-700 mb-4">
+            <div className="flex items-center gap-3">
+              <Database className="w-6 text-cyan-400" />
+              <div className="flex-1">
+                <div className="font-bold text-lg">{validatedEvents.length} events collected</div>
+                <div className="text-sm text-gray-300">Click "💾 Save Events" to store them as "{getEffectiveLabel()}"</div>
+              </div>
+              <div className="text-3xl font-bold text-cyan-400">{validatedEvents.length}</div>
             </div>
-            <div className="text-3xl font-bold text-cyan-400">{validatedEvents.length}</div>
+          </div>
+      )} 
+      */}
+
+      {/* DATASET STATUS */}
+      <div className="bg-gradient-to-r from-indigo-900/50 to-purple-900/50 p-4 rounded-xl border border-indigo-700 mb-6 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <Database className="w-5 text-indigo-400" />
+          <div>
+            <div className="font-bold">Dataset Overview</div>
+            <div className="text-xs text-indigo-300">Total Samples: {Object.values(sampleCounts).reduce((a, b) => a + b, 0)}</div>
           </div>
         </div>
-      )}
-
-      {/* DUAL DATASET STATUS PANEL */}
-      <div className="bg-gradient-to-r from-indigo-900/50 to-purple-900/50 p-4 rounded-xl border border-indigo-700 mb-6">
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2">
-            <Database className="w-5 text-indigo-400" />
-            <span className="font-semibold">📊 Dataset Status ({dualDatasetStatus.total_samples || 0} Total Samples)</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className={`px-2 py-1 rounded text-xs ${modelsStatus[activeModel]?.trained ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
-              {modelsStatus[activeModel]?.short_name || 'Model'}: {modelsStatus[activeModel]?.trained ? `✓ ${(modelsStatus[activeModel]?.cv_accuracy || 0).toFixed(1)}%` : '⚠ Not Trained'}
-            </span>
-            <button onClick={fetchStatus} className="p-2 hover:bg-gray-700 rounded-lg transition">
-              <RefreshCw className="w-4" />
-            </button>
-          </div>
-        </div>
-
-        {/* Progress Bar */}
-        <div className="mb-3">
-          <div className="flex justify-between text-sm mb-1">
-            <span className="text-gray-400">Progress: {dualDatasetStatus.total_samples || 0} / {dualDatasetStatus.target_samples}</span>
-            <span className={`font-bold ${dualDatasetStatus.progress_percent >= 100 ? 'text-green-400' : 'text-indigo-400'}`}>
-              {dualDatasetStatus.progress_percent || 0}%
-            </span>
-          </div>
-          <div className="w-full bg-gray-700 rounded-full h-3">
-            <div
-              className={`h-3 rounded-full transition-all duration-500 ${dualDatasetStatus.progress_percent >= 100 ? 'bg-green-500' : 'bg-gradient-to-r from-indigo-500 to-purple-500'}`}
-              style={{ width: `${Math.min(100, dualDatasetStatus.progress_percent || 0)}%` }}
-            />
-          </div>
-        </div>
-
-        {/* Individual Files Grid */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          {(dualDatasetStatus.individual_files || []).map((file, idx) => (
-            <div key={idx} className="p-3 rounded-lg bg-green-600/20 border border-green-500/30">
-              <div className="text-xs text-green-400 mb-1">{file.name}</div>
-              <div className="text-xl font-bold">{file.samples}</div>
-              <div className="text-xs text-gray-400">samples</div>
+        <div className="flex gap-2">
+          {Object.entries(sampleCounts).map(([name, count]) => (
+            <div key={name} className="bg-black/30 px-2 py-1 rounded text-xs">
+              <span className="text-gray-400">{name}:</span> <span className="font-mono text-white">{count}</span>
             </div>
           ))}
-          {(dualDatasetStatus.individual_files || []).length === 0 && (
-            <div className="p-3 rounded-lg bg-gray-600/20 border border-gray-500/30 col-span-2">
-              <div className="text-xs text-gray-400 mb-1">No Datasets</div>
-              <div className="text-lg font-bold text-gray-500">0 samples</div>
-              <div className="text-xs text-gray-500">Collect data to start</div>
-            </div>
-          )}
-          <div className="p-3 rounded-lg bg-purple-600/20 border border-purple-500/30">
-            <div className="text-xs text-purple-400 mb-1">Active Model</div>
-            <div className={`text-lg font-bold ${modelsStatus[activeModel]?.trained ? 'text-green-400' : 'text-yellow-400'}`}>
-              {modelsStatus[activeModel]?.trained ? '✅ Ready' : '⏳ Train'}
-            </div>
-            <div className="text-xs text-gray-400">{modelsStatus[activeModel]?.short_name || 'None'}</div>
-          </div>
-          <div className="p-3 rounded-lg bg-orange-600/20 border border-orange-500/30">
-            <div className="text-xs text-orange-400 mb-1">Persons</div>
-            <div className="text-xl font-bold">{(dualDatasetStatus.individual_files || []).length}</div>
-            <div className="text-xs text-gray-400">datasets</div>
-          </div>
         </div>
+      </div>
 
-        {/* Recommendation */}
-        <div className="mt-3 pt-3 border-t border-indigo-700">
-          <div className="text-sm text-gray-300">
-            {(dualDatasetStatus.total_samples || 0) < 5 && '💡 Collect at least 5 HOME samples to train a model'}
-            {(dualDatasetStatus.total_samples || 0) >= 5 && !modelsStatus[activeModel]?.trained &&
-              <span>💡 Ready to train! <button onClick={handleTrainMLP} className="ml-2 text-purple-400 underline hover:text-purple-300">Click to Train {modelsStatus[activeModel]?.short_name || 'Model'}</button></span>}
-            {modelsStatus[activeModel]?.trained &&
-              `🎯 ${modelsStatus[activeModel]?.short_name || 'Model'} trained with ${(modelsStatus[activeModel]?.cv_accuracy || 0).toFixed(1)}% accuracy. Ready for prediction!`}
+      {/* SIGNAL TUNING UI */}
+      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 mb-6">
+        <div className="lg:col-span-4 bg-gray-800/80 p-4 rounded-xl border border-gray-700">
+          <div className="flex justify-between items-center mb-6">
+            <div className="text-sm font-bold text-gray-400 flex items-center gap-2">
+              <Sliders size={16} /> PER-CHANNEL SIGNAL TUNING
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => {
+                  const firstGain = vibrationGains[0];
+                  setVibrationGains([firstGain, firstGain, firstGain, firstGain]);
+                  showToast(`🔗 Linked all gains to ${firstGain}x`, 'info');
+                }}
+                className="bg-gray-700 hover:bg-gray-600 text-[10px] px-2 py-1 rounded text-gray-400 border border-gray-600 transition-colors"
+                title="Apply CH0 gain to all channels"
+              >
+                SYNC GAINS
+              </button>
+              <button
+                onClick={() => {
+                  const firstGate = adcGates[0];
+                  setAdcGates([firstGate, firstGate, firstGate, firstGate]);
+                  showToast(`🔗 Linked all gates to ±${firstGate}`, 'info');
+                }}
+                className="bg-gray-700 hover:bg-gray-600 text-[10px] px-2 py-1 rounded text-gray-400 border border-gray-600 transition-colors"
+                title="Apply CH0 gate to all channels"
+              >
+                SYNC GATES
+              </button>
+              <button onClick={resetAllDetectors} className="bg-gray-700 hover:bg-gray-600 text-xs px-2 py-1 rounded text-cyan-400 flex items-center gap-1 transition-colors border border-cyan-500/30">
+                <RotateCcw size={12} /> RECALIBRATE ALL
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+            {[0, 1, 2, 3].map(idx => (
+              <div key={idx} className={`p-4 rounded-xl border transition-all ${activeChannels[idx] ? 'bg-gray-900/50 border-gray-700' : 'bg-gray-900/20 border-gray-800 opacity-40 grayscale'}`}>
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-2">
+                    <div className="w-3 h-3 rounded-full" style={{ backgroundColor: PIEZO_COLORS[idx] }}></div>
+                    <span className="font-bold text-sm tracking-widest text-gray-300">CHANNEL {idx}</span>
+                  </div>
+                  {activeChannels[idx] ? (
+                    <span className="text-[10px] bg-cyan-500/10 text-cyan-400 px-2 py-0.5 rounded-full border border-cyan-500/20">ACTIVE</span>
+                  ) : (
+                    <span className="text-[10px] bg-gray-800 text-gray-500 px-2 py-0.5 rounded-full border border-gray-700">MUTED</span>
+                  )}
+                </div>
+
+                <div className="space-y-5">
+                  {/* GAIN SLIDER */}
+                  <div>
+                    <div className="flex justify-between text-xs mb-1.5">
+                      <span className="text-gray-400">Multiplier (Gain)</span>
+                      <span className="text-cyan-400 font-mono font-bold text-sm">{vibrationGains[idx]}x</span>
+                    </div>
+                    <input
+                      type="range" min="1" max="250" step="1"
+                      value={vibrationGains[idx]}
+                      onChange={(e) => handleChannelGainChange(idx, e.target.value)}
+                      className="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                    />
+                  </div>
+
+                  {/* ADC GATE SLIDER */}
+                  <div>
+                    <div className="flex justify-between text-xs mb-1.5">
+                      <span className="text-gray-400">ADC Gate</span>
+                      <span className="text-yellow-400 font-mono font-bold text-sm">±{adcGates[idx]}</span>
+                    </div>
+                    <input
+                      type="range" min="0" max="1500" step="5"
+                      value={adcGates[idx]}
+                      onChange={(e) => handleChannelGateChange(idx, e.target.value)}
+                      className="w-full h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-yellow-400"
+                    />
+                  </div>
+
+                  {/* MINI MONITOR */}
+                  <div className="bg-black/40 rounded-lg p-2 flex items-center justify-between border border-white/5">
+                    <span className="text-[10px] text-gray-500 uppercase font-bold">Live ADC:</span>
+                    <span className={`font-mono text-sm font-bold ${Math.abs(liveRawValues[idx] - 2048) > (adcGates[idx]) ? 'text-white' : 'text-gray-600'}`}>
+                      {liveRawValues[idx]}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       </div>
 
-      {/* CONTROL BUTTONS */}
-      <div className="flex flex-wrap gap-3 mb-6">
+      {/* ACTIVE CHANNEL SELECTOR */}
+      <div className="bg-gray-800/80 p-4 rounded-xl border border-gray-700 lg:col-span-2">
+        <div className="text-sm font-bold text-gray-400 flex items-center gap-2 mb-4"><Target size={16} /> ACTIVE SENSOR MASK</div>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {[0, 1, 2, 3].map(i => (
+            <label key={i} className={`flex items-center justify-between gap-2 cursor-pointer p-3 rounded-lg border-2 transition-all ${activeChannels[i] ? 'bg-cyan-900/20 border-cyan-500/50 shadow-inner shadow-cyan-500/10' : 'bg-gray-900 border-gray-800 opacity-60'}`}>
+              <div className="flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  checked={activeChannels[i]}
+                  onChange={(e) => {
+                    const newActive = [...activeChannels];
+                    newActive[i] = e.target.checked;
+                    setActiveChannels(newActive);
+                    activeChannelsRef.current = newActive;
+                  }}
+                  className="w-5 h-5 accent-cyan-400 rounded cursor-pointer"
+                />
+                <span className={`font-mono font-bold text-lg ${activeChannels[i] ? 'text-white' : 'text-gray-600'}`}>P{i}</span>
+              </div>
+              <Activity size={16} className={activeChannels[i] ? 'text-cyan-400' : 'text-gray-700'} />
+            </label>
+          ))}
+        </div>
+        <div className="text-xs text-gray-500 mt-4 flex items-center gap-2">
+          <AlertTriangle size={14} className="text-yellow-500" />
+          Uncheck sensors NOT physically connected to stop ghost signals from floating ESP32 pins.
+        </div>
+      </div>
+
+      {/* FOOTSTEP POSITION MAP REMOVED - GO TO /tracking PAGE */}
+      <div className="flex flex-col gap-4 mb-6">
         <button
-          onClick={isConnected ? disconnectSerial : connectSerial}
-          className={`px-5 py-3 rounded-xl flex gap-2 items-center font-semibold transition-all ${isConnected
+          onClick={effectiveIsConnected
+            ? (connectionMethod === 'serial' ? disconnectSerial : disconnectWebSocket)
+            : (connectionMethod === 'serial' ? connectSerial : connectWebSocket)
+          }
+          className={`w-full py-4 text-xl rounded-xl flex justify-center gap-3 items-center font-bold transition-all ${effectiveIsConnected
             ? 'bg-red-500 hover:bg-red-600 shadow-lg shadow-red-500/20'
-            : 'bg-gradient-to-r from-cyan-500 to-blue-500 hover:from-cyan-600 hover:to-blue-600 shadow-lg shadow-cyan-500/20'
+            : (connectionMethod === 'serial'
+              ? 'bg-gradient-to-r from-emerald-500 to-green-600 hover:from-emerald-600 hover:to-green-700 shadow-xl shadow-emerald-500/30'
+              : 'bg-gradient-to-r from-purple-500 to-indigo-600 hover:from-purple-600 hover:to-indigo-700 shadow-xl shadow-purple-500/30')
             }`}
         >
-          <PlugZap className="w-5" />
-          {isConnected ? "Disconnect" : "Connect Serial"}
+          <PlugZap className="w-8 h-8" />
+          {effectiveIsConnected ? "STOP TRACKING" : `CONNECT ${connectionMethod === 'serial' ? 'SERIAL' : 'WIFI'} SENSOR`}
         </button>
 
-        {manualCaptureMode && isConnected && (
-          <button
-            onClick={handleManualCapture}
-            className="bg-gradient-to-r from-purple-500 to-pink-500 px-6 py-3 rounded-xl flex gap-2 items-center font-bold hover:from-purple-600 hover:to-pink-600 transition-all shadow-lg shadow-purple-500/30 animate-pulse"
-          >
-            <Eye className="w-5" />
-            📸 Capture Now
-          </button>
-        )}
-
-        {/* Capture Highlight Indicator */}
-        {captureHighlight && (
-          <div className="bg-yellow-500/20 border border-yellow-500 px-4 py-3 rounded-xl flex gap-2 items-center font-medium text-yellow-300 animate-pulse">
-            <span className="text-lg">📸</span>
-            <span>Captured {captureHighlight.samples} samples ({(captureHighlight.samples / 200 * 1000).toFixed(0)}ms) - shown in yellow on graph</span>
+        {!effectiveIsConnected && (connectionMethod === 'websocket' || wsStatus === 'Error' || wsStatus.includes('Reconnecting')) && (
+          <div className="bg-purple-900/20 border border-purple-500/30 p-4 rounded-xl flex items-center justify-between gap-4">
+            <div className="flex items-center gap-4">
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] text-purple-400 uppercase font-bold">Gateway IP</span>
+                <input
+                  type="text"
+                  value={gatewayIp}
+                  onChange={(e) => setGatewayIp(e.target.value)}
+                  className="bg-black/40 border border-purple-500/30 rounded px-3 py-1.5 text-sm text-white outline-none focus:border-purple-400 w-40 font-mono"
+                />
+              </div>
+              <div className="text-xs text-gray-400 max-w-sm">
+                Connect to <b className="text-white">"Pranshul"</b> WiFi (Pass: Pranshul@007) before tracking.
+                {wsStatus.includes('Reconnecting') && <span className="block text-yellow-400 animate-pulse mt-1">Status: {wsStatus}</span>}
+              </div>
+            </div>
+            <a
+              href={`http://${gatewayIp}`}
+              target="_blank"
+              rel="noreferrer"
+              className="px-4 py-2 bg-cyan-900/20 text-cyan-400 border border-cyan-500/30 rounded-lg text-xs font-bold uppercase hover:bg-cyan-600 hover:text-white transition-all flex items-center gap-2"
+            >
+              <Zap size={14} /> Ping Check
+            </a>
           </div>
         )}
-
-        <button
-          onClick={handleSaveTrainData}
-          disabled={isSaving || validatedEvents.length === 0}
-          className="bg-gradient-to-r from-green-500 to-emerald-500 px-6 py-3 rounded-xl flex gap-2 items-center font-bold disabled:opacity-50 disabled:cursor-not-allowed hover:from-green-600 hover:to-emerald-600 transition-all shadow-lg shadow-green-500/30"
-        >
-          {isSaving ? <RefreshCw className="animate-spin w-5" /> : <Database className="w-5" />}
-          💾 Save Events ({validatedEvents.length})
-        </button>
-
-        <button
-          onClick={() => {
-            setValidatedEvents([]);
-            showToast('🗑️ Cleared all collected events', 'info');
-          }}
-          disabled={validatedEvents.length === 0}
-          className="bg-gray-700 hover:bg-gray-600 px-4 py-3 rounded-xl flex gap-2 items-center font-semibold disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-        >
-          <Trash2 className="w-5" />
-          Clear
-        </button>
-
-        {/* Predict Section with Model Selection */}
-        <div className="flex items-center gap-2">
-          <select
-            value={selectedModel}
-            onChange={(e) => setSelectedModel(e.target.value)}
-            className="bg-gray-700 border border-gray-600 text-white px-3 py-3 rounded-xl focus:outline-none focus:ring-2 focus:ring-cyan-500"
-          >
-            {availableModels.filter(m => m.ready).map(model => (
-              <option key={model.name} value={model.name}>
-                {model.short_name} {model.trained ? `(${(model.cv_accuracy || 0).toFixed(1)}%)` : '(Not Trained)'}
-              </option>
-            ))}
-          </select>
-          <button
-            onClick={handlePredictMLP}
-            disabled={isPredicting || validatedEvents.length === 0 || !modelsStatus[selectedModel]?.trained}
-            className="bg-gradient-to-r from-cyan-500 to-blue-500 px-5 py-3 rounded-xl flex gap-2 items-center font-semibold disabled:opacity-50 disabled:cursor-not-allowed hover:from-cyan-600 hover:to-blue-600 transition-all shadow-lg shadow-cyan-500/20"
-            title={modelsStatus[selectedModel]?.trained ? `Predict with ${modelsStatus[selectedModel]?.short_name} (${(modelsStatus[selectedModel]?.cv_accuracy || 0).toFixed(1)}% accuracy)` : 'Model not trained'}
-          >
-            {isPredicting ? <RefreshCw className="animate-spin w-5" /> : <Zap className="w-5" />}
-            🔮 Predict
-          </button>
-        </div>
       </div>
+
+
+
+      {/* SAVE EVENTS BUTTON */}
+      <button
+        onClick={handleSaveTrainData}
+        disabled={validatedEvents.length === 0}
+        className={`w-full md:w-auto py-4 px-8 text-xl rounded-xl flex justify-center gap-3 items-center font-bold transition-all ${validatedEvents.length > 0
+          ? 'bg-blue-600 hover:bg-blue-700 shadow-lg shadow-blue-500/20'
+          : 'bg-gray-800 text-gray-500 cursor-not-allowed'
+          }`}
+      >
+        <Database className="w-6 h-6" />
+        Save {validatedEvents.length} Events
+      </button>
 
       {/* STATUS BAR */}
       <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700 mb-6">
@@ -1827,134 +2245,316 @@ function Vibrations() {
       </div>
 
       {/* PREDICTION RESULT - Collapsible */}
-      {prediction && prediction.formatted && (
-        <div className={`mb-6 p-5 rounded-xl border-2 transition-all ${prediction.color_code === 'red'
-          ? 'bg-red-900/50 border-red-500 shadow-lg shadow-red-500/30 animate-pulse'
-          : prediction.color_code === 'green'
-            ? 'bg-green-900/50 border-green-500 shadow-lg shadow-green-500/20'
-            : 'bg-yellow-900/50 border-yellow-500 shadow-lg shadow-yellow-500/20'
-          }`}>
-          <div className="flex items-center justify-between mb-3">
-            <div className="text-xl font-bold">
-              {prediction.is_intruder ? '🚨 INTRUDER!' : prediction.confidence >= 0.5 ? '✅ FAMILY' : '⚠ UNCERTAIN'}
+      {
+        prediction && prediction.formatted && (
+          <div className={`mb-6 p-5 rounded-xl border-2 transition-all ${prediction.color_code === 'red'
+            ? 'bg-red-900/50 border-red-500 shadow-lg shadow-red-500/30 animate-pulse'
+            : prediction.color_code === 'green'
+              ? 'bg-green-900/50 border-green-500 shadow-lg shadow-green-500/20'
+              : 'bg-yellow-900/50 border-yellow-500 shadow-lg shadow-yellow-500/20'
+            }`}>
+            <div className="flex items-center justify-between mb-3">
+              <div className="text-xl font-bold">
+                {prediction.is_intruder ? '🚨 INTRUDER!' : prediction.confidence >= 0.5 ? '✅ FAMILY' : '⚠ UNCERTAIN'}
+              </div>
+              <div className="flex items-center gap-3">
+                {prediction.alert && <span className="text-sm opacity-75">{prediction.alert}</span>}
+                <button
+                  onClick={() => setPrediction(null)}
+                  className="p-2 hover:bg-gray-700/50 rounded-lg transition text-gray-400 hover:text-white"
+                  title="Close prediction"
+                >
+                  ✕
+                </button>
+              </div>
             </div>
-            <div className="flex items-center gap-3">
-              {prediction.alert && <span className="text-sm opacity-75">{prediction.alert}</span>}
-              <button
-                onClick={() => setPrediction(null)}
-                className="p-2 hover:bg-gray-700/50 rounded-lg transition text-gray-400 hover:text-white"
-                title="Close prediction"
-              >
-                ✕
-              </button>
-            </div>
-          </div>
-          <div className="text-4xl font-bold mb-2">{prediction.formatted.person}</div>
-          <div className="text-xl mb-2">Confidence: {prediction.formatted.confidenceDisplay}</div>
+            <div className="text-4xl font-bold mb-2">{prediction.formatted.person}</div>
+            <div className="text-xl mb-2">Confidence: {prediction.formatted.confidenceDisplay}</div>
 
-          {/* Enhanced Scoring Details */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4 text-sm bg-gray-900/50 rounded-lg p-3">
-            <div className="text-center">
-              <div className="text-gray-400">Anomaly Score</div>
-              <div className={`font-bold ${prediction.anomaly_score > prediction.threshold ? 'text-red-400' : 'text-green-400'}`}>
-                {prediction.anomaly_score?.toFixed(3) ?? 'N/A'}
+            {/* Enhanced Scoring Details */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4 text-sm bg-gray-900/50 rounded-lg p-3">
+              <div className="text-center">
+                <div className="text-gray-400">Anomaly Score</div>
+                <div className={`font-bold ${prediction.anomaly_score > prediction.threshold ? 'text-red-400' : 'text-green-400'}`}>
+                  {prediction.anomaly_score?.toFixed(3) ?? 'N/A'}
+                </div>
+              </div>
+              <div className="text-center">
+                <div className="text-gray-400">Threshold</div>
+                <div className="font-bold text-blue-400">{prediction.threshold?.toFixed(3) ?? 'N/A'}</div>
+              </div>
+              <div className="text-center">
+                <div className="text-gray-400">Confidence Band</div>
+                <div className={`font-bold ${prediction.confidence_band === 'high' ? 'text-green-400' :
+                  prediction.confidence_band === 'medium' ? 'text-yellow-400' : 'text-orange-400'
+                  }`}>
+                  {prediction.confidence_band?.toUpperCase() ?? 'N/A'}
+                </div>
+              </div>
+              <div className="text-center">
+                <div className="text-gray-400">Model Agreement</div>
+                <div className={`font-bold ${prediction.svm_agrees ? 'text-green-400' : prediction.svm_agrees === false ? 'text-yellow-400' : 'text-gray-400'}`}>
+                  {prediction.svm_agrees === true ? '✓ Confirmed' : prediction.svm_agrees === false ? '⚠ Uncertain' : 'N/A'}
+                </div>
               </div>
             </div>
-            <div className="text-center">
-              <div className="text-gray-400">Threshold</div>
-              <div className="font-bold text-blue-400">{prediction.threshold?.toFixed(3) ?? 'N/A'}</div>
-            </div>
-            <div className="text-center">
-              <div className="text-gray-400">Confidence Band</div>
-              <div className={`font-bold ${prediction.confidence_band === 'high' ? 'text-green-400' :
-                prediction.confidence_band === 'medium' ? 'text-yellow-400' : 'text-orange-400'
-                }`}>
-                {prediction.confidence_band?.toUpperCase() ?? 'N/A'}
-              </div>
-            </div>
-            <div className="text-center">
-              <div className="text-gray-400">Model Agreement</div>
-              <div className={`font-bold ${prediction.svm_agrees ? 'text-green-400' : prediction.svm_agrees === false ? 'text-yellow-400' : 'text-gray-400'}`}>
-                {prediction.svm_agrees === true ? '✓ Confirmed' : prediction.svm_agrees === false ? '⚠ Uncertain' : 'N/A'}
-              </div>
-            </div>
-          </div>
 
-          {prediction.probabilities && (
-            <div className="space-y-2">
-              {Object.entries(prediction.probabilities)
-                .sort((a, b) => b[1] - a[1])
-                .map(([name, prob]) => (
-                  <div key={name} className="flex items-center gap-3">
-                    <span className="w-24 text-sm">{name}</span>
-                    <div className="flex-1 bg-gray-700 rounded-full h-3 overflow-hidden">
-                      <div
-                        className={`h-full rounded-full transition-all duration-500 ${name === 'INTRUDER'
-                          ? 'bg-gradient-to-r from-red-500 to-red-400'
-                          : 'bg-gradient-to-r from-green-400 to-emerald-500'
-                          }`}
-                        style={{ width: `${prob * 100}%` }}
-                      />
+            {prediction.probabilities && (
+              <div className="space-y-2">
+                {Object.entries(prediction.probabilities)
+                  .sort((a, b) => b[1] - a[1])
+                  .map(([name, prob]) => (
+                    <div key={name} className="flex items-center gap-3">
+                      <span className="w-24 text-sm">{name}</span>
+                      <div className="flex-1 bg-gray-700 rounded-full h-3 overflow-hidden">
+                        <div
+                          className={`h-full rounded-full transition-all duration-500 ${name === 'INTRUDER'
+                            ? 'bg-gradient-to-r from-red-500 to-red-400'
+                            : 'bg-gradient-to-r from-green-400 to-emerald-500'
+                            }`}
+                          style={{ width: `${prob * 100}%` }}
+                        />
+                      </div>
+                      <span className="text-sm w-14 text-right">{(prob * 100).toFixed(1)}%</span>
                     </div>
-                    <span className="text-sm w-14 text-right">{(prob * 100).toFixed(1)}%</span>
-                  </div>
-                ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* TRAINING METRICS */}
-      {trainingMetrics && (
-        <div className="mb-6 p-4 bg-gradient-to-r from-green-900/50 to-emerald-900/50 rounded-xl border border-green-700">
-          <div className="font-bold mb-2 flex items-center gap-2">
-            <TrendingUp className="w-5" /> Training Results
-          </div>
-          <div className="text-sm">{formatMetrics(trainingMetrics)}</div>
-        </div>
-      )}
-
-      {/* VISUALIZATION GRAPHS */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
-        {/* Amplified Signal */}
-        <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700">
-          <div className="flex items-center gap-2 mb-3">
-            <Radio className="w-5 text-cyan-400" />
-            <span className="font-semibold">Amplified Vibration Signal</span>
-          </div>
-          <div className="h-48">
-            <Line data={amplifiedChartData} options={chartOptions} key={isConnected ? 'connected' : 'disconnected'} />
-          </div>
-        </div>
-
-        {/* FFT */}
-        <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700">
-          <div className="flex items-center gap-2 mb-3">
-            <TrendingUp className="w-5 text-purple-400" />
-            <span className="font-semibold">FFT Spectrum (Last Event)</span>
-          </div>
-          <div className="h-48">
-            {fftData.frequencies.length > 0 ? (
-              <Bar data={fftChartData} options={fftChartOptions} />
-            ) : (
-              <div className="h-full flex items-center justify-center text-gray-500">
-                Waiting for footstep event...
+                  ))}
               </div>
             )}
           </div>
+        )
+      }
+
+      {/* TRAINING METRICS */}
+      {
+        trainingMetrics && (
+          <div className="mb-6 p-4 bg-gradient-to-r from-green-900/50 to-emerald-900/50 rounded-xl border border-green-700">
+            <div className="font-bold mb-2 flex items-center gap-2">
+              <TrendingUp className="w-5" /> Training Results
+            </div>
+            <div className="text-sm">{formatMetrics(trainingMetrics)}</div>
+          </div>
+        )
+      }
+
+      {/* VISUALIZATION GRAPHS */}
+      <div className="grid grid-cols-1 mb-6">
+        {/* Multi-Piezo Signals (4 Sensors) - SEPARATE CHANNELS */}
+        <div className="bg-gray-800/50 p-4 rounded-xl border border-cyan-700/50 mb-4">
+          <div className="flex items-center gap-2 mb-3">
+            <Activity className="w-5 text-cyan-400" />
+            <span className="font-semibold">Multi-Piezo Signals (4 Separate Channels)</span>
+            <div className="flex gap-2 ml-auto">
+              <div className="flex gap-4 items-center mr-6 bg-black/40 px-3 py-1 rounded-lg border border-white/5">
+                <span className="text-[10px] text-gray-500 uppercase tracking-widest font-bold">ADC Monitor:</span>
+                {[0, 1, 2, 3].map(i => (
+                  <div key={i} className="flex items-center gap-1.5">
+                    <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: PIEZO_COLORS[i] }}></span>
+                    <span className={`font-mono text-xs font-bold ${Math.abs(liveRawValues[i] - 2048) > (adcGates[i]) ? 'text-white' : 'text-gray-500'}`}>
+                      {liveRawValues[i]}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              {PIEZO_COLORS.map((color, idx) => (
+                <span key={idx} className="flex items-center gap-1 text-xs">
+                  <span className="w-3 h-3 rounded-full" style={{ backgroundColor: color }}></span>
+                  Piezo {idx}
+                </span>
+              ))}
+            </div>
+          </div>
+
+          {/* Grid of 4 separate channel plots */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+            {[0, 1, 2, 3].map((piezoIdx) => {
+              const piezoData = amplifiedDataMulti[piezoIdx] || [];
+              const piezoTimeLabels = piezoData.map(d => d.time.toFixed(2));
+
+              const singlePiezoChartData = {
+                labels: piezoTimeLabels,
+                datasets: [{
+                  label: `Piezo ${piezoIdx} Filtered Signal`,
+                  data: piezoData.map(d => d.value),
+                  borderColor: PIEZO_COLORS[piezoIdx],
+                  backgroundColor: `${PIEZO_COLORS[piezoIdx]}25`,
+                  borderWidth: 1.5,
+                  pointRadius: 0,
+                  fill: true,
+                  tension: 0.1
+                }]
+              };
+
+              // Add capture highlight for Piezo 0 if active
+              if (piezoIdx === 0 && captureHighlight) {
+                singlePiezoChartData.datasets.push({
+                  label: `📸 Captured (${captureHighlight.samples} samples)`,
+                  data: piezoData.map((d, idx) => {
+                    if (idx >= captureHighlight.startIdx && idx < captureHighlight.endIdx) {
+                      return d.value;
+                    }
+                    return null;
+                  }),
+                  borderColor: "#fbbf24",
+                  backgroundColor: "rgba(251, 191, 36, 0.4)",
+                  borderWidth: 3,
+                  pointRadius: 0,
+                  fill: true,
+                  tension: 0.1,
+                  order: -1
+                });
+              }
+
+              const singlePiezoOptions = {
+                responsive: true,
+                maintainAspectRatio: false,
+                animation: { duration: 0 },
+                scales: {
+                  x: { display: false },
+                  y: {
+                    grid: { color: 'rgba(255,255,255,0.1)' },
+                    ticks: { color: '#9ca3af', font: { size: 10 } }
+                  }
+                },
+                plugins: {
+                  legend: {
+                    display: true,
+                    position: 'top',
+                    labels: {
+                      color: '#9ca3af',
+                      font: { size: 10 },
+                      usePointStyle: true,
+                      boxWidth: 20
+                    }
+                  }
+                }
+              };
+
+              return (
+                <div key={piezoIdx} className="bg-gray-900/50 p-3 rounded-lg border border-gray-700">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Waves className="w-4" style={{ color: PIEZO_COLORS[piezoIdx] }} />
+                    <span className="text-sm font-semibold" style={{ color: PIEZO_COLORS[piezoIdx] }}>
+                      Channel {piezoIdx}
+                    </span>
+                    <span className="text-xs text-gray-500 ml-auto">
+                      {piezoData.length} samples
+                    </span>
+                  </div>
+                  <div className="h-40">
+                    {piezoData.length > 0 ? (
+                      <Line data={singlePiezoChartData} options={singlePiezoOptions} />
+                    ) : (
+                      <div className="h-full flex items-center justify-center text-gray-600 text-xs">
+                        Waiting for data...
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
 
-        {/* LIF Neuron */}
-        <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700 lg:col-span-2">
-          <div className="flex items-center gap-2 mb-3">
-            <Zap className="w-5 text-green-400" />
-            <span className="font-semibold">LIF Neuron Model (Membrane Potential)</span>
-            <span className="text-xs text-gray-400 ml-auto">
-              Spikes: {spikeMarkers.length} | Rate: {lifNeuronRef.current?.getSpikeRate().toFixed(1) || 0} Hz
-            </span>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {/* FFT (Kept as is) */}
+          <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700">
+            <div className="flex items-center gap-2 mb-3">
+              <TrendingUp className="w-5 text-purple-400" />
+              <span className="font-semibold">FFT Spectrum (Last Event)</span>
+            </div>
+            <div className="h-48">
+              {fftData.frequencies.length > 0 ? (
+                <Bar data={fftChartData} options={fftChartOptions} />
+              ) : (
+                <div className="h-full flex items-center justify-center text-gray-500">
+                  Waiting for footstep event...
+                </div>
+              )}
+            </div>
           </div>
-          <div className="h-40">
-            <Line data={lifChartData} options={chartOptions} />
+
+          {/* Multi-Piezo LIF Neurons - SEPARATE CHANNELS */}
+          <div className="bg-gray-800/50 p-4 rounded-xl border border-green-700/50">
+            <div className="flex items-center gap-2 mb-3">
+              <Zap className="w-5 text-green-400" />
+              <span className="font-semibold">Multi-Piezo LIF Neurons (4 Separate Channels)</span>
+            </div>
+
+            {/* Grid of 4 separate LIF neuron plots */}
+            <div className="grid grid-cols-2 gap-2">
+              {[0, 1, 2, 3].map((piezoIdx) => {
+                const lifData = lifDataMulti[piezoIdx] || [];
+                const lifTimeLabels = lifData.map(d => d.time.toFixed(2));
+
+                const singleLifChartData = {
+                  labels: lifTimeLabels,
+                  datasets: [
+                    {
+                      label: `P${piezoIdx} Membrane`,
+                      data: lifData.map(d => d.membrane),
+                      borderColor: PIEZO_COLORS[piezoIdx],
+                      backgroundColor: `${PIEZO_COLORS[piezoIdx]}15`,
+                      borderWidth: 1.5,
+                      pointRadius: 0,
+                      fill: true,
+                      tension: 0.1
+                    },
+                    {
+                      label: "Threshold",
+                      data: lifTimeLabels.map(() => 0.025),
+                      borderColor: "#ef4444",
+                      borderWidth: 1,
+                      borderDash: [5, 5],
+                      pointRadius: 0,
+                      fill: false
+                    }
+                  ]
+                };
+
+                const singleLifOptions = {
+                  responsive: true,
+                  maintainAspectRatio: false,
+                  animation: { duration: 0 },
+                  scales: {
+                    x: { display: false },
+                    y: {
+                      grid: { color: 'rgba(255,255,255,0.1)' },
+                      ticks: { color: '#9ca3af', font: { size: 9 } },
+                      min: 0,
+                      max: 0.03
+                    }
+                  },
+                  plugins: {
+                    legend: { display: false }
+                  }
+                };
+
+                const spikeRate = lifNeuronsRef.current[piezoIdx]?.getSpikeRate().toFixed(1) || 0;
+
+                return (
+                  <div key={piezoIdx} className="bg-gray-900/50 p-2 rounded-lg border border-gray-700">
+                    <div className="flex items-center gap-1 mb-1">
+                      <Zap className="w-3" style={{ color: PIEZO_COLORS[piezoIdx] }} />
+                      <span className="text-xs font-semibold" style={{ color: PIEZO_COLORS[piezoIdx] }}>
+                        P{piezoIdx}
+                      </span>
+                      <span className="text-xs text-gray-500 ml-auto">
+                        {spikeRate}Hz
+                      </span>
+                    </div>
+                    <div className="h-24">
+                      {lifData.length > 0 ? (
+                        <Line data={singleLifChartData} options={singleLifOptions} />
+                      ) : (
+                        <div className="h-full flex items-center justify-center text-gray-600 text-xs">
+                          No data
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         </div>
       </div>
@@ -2195,120 +2795,122 @@ function Vibrations() {
       </div>
 
       {/* DETAILED TRAINING RESULTS PANEL */}
-      {showTrainingDetails && trainingDetails && (
-        <div className="mb-6 p-4 bg-gradient-to-br from-indigo-900/60 to-purple-900/60 rounded-xl border border-indigo-600 shadow-lg">
-          <div className="flex items-center justify-between mb-4">
-            <div className="font-bold text-lg flex items-center gap-2">
-              <Brain className="w-5 text-indigo-400" />
-              {trainingDetails.modelDisplayName || 'Model'} Training Report
-            </div>
-            <button
-              onClick={() => setShowTrainingDetails(false)}
-              className="text-gray-400 hover:text-white transition-colors p-1"
-            >
-              <X className="w-5 h-5" />
-            </button>
-          </div>
-
-          {/* Model Badge */}
-          {trainingDetails.modelName && (
-            <div className="mb-3">
-              <span className="px-3 py-1 rounded-full text-sm font-medium bg-purple-600/40 text-purple-200 border border-purple-500/30">
-                {trainingDetails.modelName}
-              </span>
-            </div>
-          )}
-
-          {/* Accuracy Section */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-            <div className="bg-gray-800/60 rounded-lg p-3 text-center">
-              <div className="text-2xl font-bold text-green-400">{trainingDetails.accuracy}%</div>
-              <div className="text-xs text-gray-400">Final Accuracy</div>
-            </div>
-            <div className="bg-gray-800/60 rounded-lg p-3 text-center">
-              <div className="text-2xl font-bold text-blue-400">
-                {trainingDetails.cvAccuracy ?? 'N/A'}%
+      {
+        showTrainingDetails && trainingDetails && (
+          <div className="mb-6 p-4 bg-gradient-to-br from-indigo-900/60 to-purple-900/60 rounded-xl border border-indigo-600 shadow-lg">
+            <div className="flex items-center justify-between mb-4">
+              <div className="font-bold text-lg flex items-center gap-2">
+                <Brain className="w-5 text-indigo-400" />
+                {trainingDetails.modelDisplayName || 'Model'} Training Report
               </div>
-              <div className="text-xs text-gray-400">CV Accuracy</div>
+              <button
+                onClick={() => setShowTrainingDetails(false)}
+                className="text-gray-400 hover:text-white transition-colors p-1"
+              >
+                <X className="w-5 h-5" />
+              </button>
             </div>
-            <div className="bg-gray-800/60 rounded-lg p-3 text-center">
-              <div className="text-2xl font-bold text-yellow-400">±{trainingDetails.cvStd ?? 0}%</div>
-              <div className="text-xs text-gray-400">Std Dev</div>
-            </div>
-            <div className="bg-gray-800/60 rounded-lg p-3 text-center">
-              <div className="text-2xl font-bold text-purple-400">{trainingDetails.nFolds}</div>
-              <div className="text-xs text-gray-400">Folds</div>
-            </div>
-          </div>
 
-          {/* Cross-Validation Scores */}
-          {trainingDetails.cvScores?.length > 0 && (
-            <div className="mb-4">
-              <div className="text-sm font-semibold text-gray-300 mb-2">
-                📊 Cross-Validation Fold Scores
+            {/* Model Badge */}
+            {trainingDetails.modelName && (
+              <div className="mb-3">
+                <span className="px-3 py-1 rounded-full text-sm font-medium bg-purple-600/40 text-purple-200 border border-purple-500/30">
+                  {trainingDetails.modelName}
+                </span>
               </div>
-              <div className="flex flex-wrap gap-2">
-                {trainingDetails.cvScores.map((score, idx) => (
-                  <div
-                    key={idx}
-                    className={`px-3 py-1 rounded-full text-sm font-medium ${score >= 90 ? 'bg-green-600/40 text-green-300' :
-                      score >= 80 ? 'bg-yellow-600/40 text-yellow-300' :
-                        'bg-red-600/40 text-red-300'
-                      }`}
-                  >
-                    Fold {idx + 1}: {score}%
-                  </div>
-                ))}
+            )}
+
+            {/* Accuracy Section */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+              <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+                <div className="text-2xl font-bold text-green-400">{trainingDetails.accuracy}%</div>
+                <div className="text-xs text-gray-400">Final Accuracy</div>
+              </div>
+              <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+                <div className="text-2xl font-bold text-blue-400">
+                  {trainingDetails.cvAccuracy ?? 'N/A'}%
+                </div>
+                <div className="text-xs text-gray-400">CV Accuracy</div>
+              </div>
+              <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+                <div className="text-2xl font-bold text-yellow-400">±{trainingDetails.cvStd ?? 0}%</div>
+                <div className="text-xs text-gray-400">Std Dev</div>
+              </div>
+              <div className="bg-gray-800/60 rounded-lg p-3 text-center">
+                <div className="text-2xl font-bold text-purple-400">{trainingDetails.nFolds}</div>
+                <div className="text-xs text-gray-400">Folds</div>
               </div>
             </div>
-          )}
 
-          {/* Sample Distribution */}
-          <div className="grid grid-cols-3 gap-3 mb-4">
-            <div className="bg-gray-800/60 rounded-lg p-3">
-              <div className="text-lg font-bold text-cyan-400">{trainingDetails.homeSamples}</div>
-              <div className="text-xs text-gray-400">HOME Samples</div>
-            </div>
-            <div className="bg-gray-800/60 rounded-lg p-3">
-              <div className="text-lg font-bold text-orange-400">{trainingDetails.intruderSamples}</div>
-              <div className="text-xs text-gray-400">INTRUDER (Synthetic)</div>
-            </div>
-            <div className="bg-gray-800/60 rounded-lg p-3">
-              <div className="text-lg font-bold text-white">{trainingDetails.totalSamples}</div>
-              <div className="text-xs text-gray-400">Total Samples</div>
-            </div>
-          </div>
-
-          {/* Datasets Used */}
-          {trainingDetails.datasets?.length > 0 && (
-            <div>
-              <div className="text-sm font-semibold text-gray-300 mb-2">
-                📁 Datasets Used for Training
-              </div>
-              <div className="bg-gray-800/60 rounded-lg p-3">
+            {/* Cross-Validation Scores */}
+            {trainingDetails.cvScores?.length > 0 && (
+              <div className="mb-4">
+                <div className="text-sm font-semibold text-gray-300 mb-2">
+                  📊 Cross-Validation Fold Scores
+                </div>
                 <div className="flex flex-wrap gap-2">
-                  {trainingDetails.datasets.map((dataset, idx) => (
+                  {trainingDetails.cvScores.map((score, idx) => (
                     <div
                       key={idx}
-                      className="flex items-center gap-2 px-3 py-2 bg-gray-700/60 rounded-lg border border-gray-600"
+                      className={`px-3 py-1 rounded-full text-sm font-medium ${score >= 90 ? 'bg-green-600/40 text-green-300' :
+                        score >= 80 ? 'bg-yellow-600/40 text-yellow-300' :
+                          'bg-red-600/40 text-red-300'
+                        }`}
                     >
-                      <User className="w-4 h-4 text-emerald-400" />
-                      <span className="font-medium text-emerald-300">{dataset.name}</span>
-                      <span className="text-xs text-gray-400 bg-gray-600/60 px-2 py-0.5 rounded">
-                        {dataset.samples} samples
-                      </span>
+                      Fold {idx + 1}: {score}%
                     </div>
                   ))}
                 </div>
-                <div className="mt-2 text-xs text-gray-500">
-                  Total {trainingDetails.datasets.length} dataset(s) •
-                  {trainingDetails.datasetNames?.join(', ')}
-                </div>
+              </div>
+            )}
+
+            {/* Sample Distribution */}
+            <div className="grid grid-cols-3 gap-3 mb-4">
+              <div className="bg-gray-800/60 rounded-lg p-3">
+                <div className="text-lg font-bold text-cyan-400">{trainingDetails.homeSamples}</div>
+                <div className="text-xs text-gray-400">HOME Samples</div>
+              </div>
+              <div className="bg-gray-800/60 rounded-lg p-3">
+                <div className="text-lg font-bold text-orange-400">{trainingDetails.intruderSamples}</div>
+                <div className="text-xs text-gray-400">INTRUDER (Synthetic)</div>
+              </div>
+              <div className="bg-gray-800/60 rounded-lg p-3">
+                <div className="text-lg font-bold text-white">{trainingDetails.totalSamples}</div>
+                <div className="text-xs text-gray-400">Total Samples</div>
               </div>
             </div>
-          )}
-        </div>
-      )}
+
+            {/* Datasets Used */}
+            {trainingDetails.datasets?.length > 0 && (
+              <div>
+                <div className="text-sm font-semibold text-gray-300 mb-2">
+                  📁 Datasets Used for Training
+                </div>
+                <div className="bg-gray-800/60 rounded-lg p-3">
+                  <div className="flex flex-wrap gap-2">
+                    {trainingDetails.datasets.map((dataset, idx) => (
+                      <div
+                        key={idx}
+                        className="flex items-center gap-2 px-3 py-2 bg-gray-700/60 rounded-lg border border-gray-600"
+                      >
+                        <User className="w-4 h-4 text-emerald-400" />
+                        <span className="font-medium text-emerald-300">{dataset.name}</span>
+                        <span className="text-xs text-gray-400 bg-gray-600/60 px-2 py-0.5 rounded">
+                          {dataset.samples} samples
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="mt-2 text-xs text-gray-500">
+                    Total {trainingDetails.datasets.length} dataset(s) •
+                    {trainingDetails.datasetNames?.join(', ')}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )
+      }
 
       {/* RESET & DATASET MANAGER */}
       <div className="bg-gray-800/50 p-4 rounded-xl border border-red-900/30 mb-6">
@@ -2613,166 +3215,168 @@ function Vibrations() {
       />
 
       {/* DATASET PREVIEW MODAL */}
-      {showDatasetPreview && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 rounded-2xl border border-gray-700 shadow-2xl w-full max-w-5xl max-h-[90vh] overflow-hidden flex flex-col">
-            {/* Modal Header */}
-            <div className="flex items-center justify-between p-4 border-b border-gray-700 bg-gray-800/50">
-              <div className="flex items-center gap-3">
-                <Database className="w-6 text-cyan-400" />
-                <div>
-                  <h2 className="text-xl font-bold">{previewData?.person || 'Loading...'} Dataset</h2>
-                  <p className="text-sm text-gray-400">
-                    {previewData ? `${previewData.total_samples} samples • ${previewData.waveform_count || 0} waveforms` : 'Loading...'}
-                  </p>
+      {
+        showDatasetPreview && (
+          <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <div className="bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 rounded-2xl border border-gray-700 shadow-2xl w-full max-w-5xl max-h-[90vh] overflow-hidden flex flex-col">
+              {/* Modal Header */}
+              <div className="flex items-center justify-between p-4 border-b border-gray-700 bg-gray-800/50">
+                <div className="flex items-center gap-3">
+                  <Database className="w-6 text-cyan-400" />
+                  <div>
+                    <h2 className="text-xl font-bold">{previewData?.person || 'Loading...'} Dataset</h2>
+                    <p className="text-sm text-gray-400">
+                      {previewData ? `${previewData.total_samples} samples • ${previewData.waveform_count || 0} waveforms` : 'Loading...'}
+                    </p>
+                  </div>
                 </div>
-              </div>
-              <div className="flex items-center gap-2">
-                {previewData && (
+                <div className="flex items-center gap-2">
+                  {previewData && (
+                    <button
+                      onClick={() => handleDownloadIndividualDataset(previewData.person)}
+                      disabled={downloadingPerson === previewData.person}
+                      className="bg-blue-500 hover:bg-blue-600 px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition disabled:opacity-50"
+                    >
+                      {downloadingPerson === previewData.person ? (
+                        <RefreshCw className="w-4 animate-spin" />
+                      ) : (
+                        <Download className="w-4" />
+                      )}
+                      Download ZIP
+                    </button>
+                  )}
                   <button
-                    onClick={() => handleDownloadIndividualDataset(previewData.person)}
-                    disabled={downloadingPerson === previewData.person}
-                    className="bg-blue-500 hover:bg-blue-600 px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition disabled:opacity-50"
+                    onClick={() => setShowDatasetPreview(false)}
+                    className="p-2 hover:bg-gray-700 rounded-lg transition text-gray-400 hover:text-white"
                   >
-                    {downloadingPerson === previewData.person ? (
-                      <RefreshCw className="w-4 animate-spin" />
-                    ) : (
-                      <Download className="w-4" />
-                    )}
-                    Download ZIP
+                    <X className="w-5" />
                   </button>
-                )}
-                <button
-                  onClick={() => setShowDatasetPreview(false)}
-                  className="p-2 hover:bg-gray-700 rounded-lg transition text-gray-400 hover:text-white"
-                >
-                  <X className="w-5" />
-                </button>
-              </div>
-            </div>
-
-            {/* Modal Content */}
-            <div className="flex-1 overflow-auto p-4">
-              {previewLoading ? (
-                <div className="flex items-center justify-center h-64">
-                  <RefreshCw className="w-8 h-8 animate-spin text-cyan-400" />
-                  <span className="ml-3 text-gray-400">Loading dataset preview...</span>
                 </div>
-              ) : previewData ? (
-                <div className="space-y-6">
-                  {/* Feature Statistics */}
-                  {previewData.feature_stats && Object.keys(previewData.feature_stats).length > 0 && (
+              </div>
+
+              {/* Modal Content */}
+              <div className="flex-1 overflow-auto p-4">
+                {previewLoading ? (
+                  <div className="flex items-center justify-center h-64">
+                    <RefreshCw className="w-8 h-8 animate-spin text-cyan-400" />
+                    <span className="ml-3 text-gray-400">Loading dataset preview...</span>
+                  </div>
+                ) : previewData ? (
+                  <div className="space-y-6">
+                    {/* Feature Statistics */}
+                    {previewData.feature_stats && Object.keys(previewData.feature_stats).length > 0 && (
+                      <div className="bg-gray-800/50 rounded-xl p-4 border border-gray-700">
+                        <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
+                          <TrendingUp className="w-5 text-purple-400" />
+                          Feature Statistics (Top 10)
+                        </h3>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-sm">
+                            <thead>
+                              <tr className="border-b border-gray-700 text-gray-400">
+                                <th className="text-left p-2">Feature</th>
+                                <th className="text-right p-2">Mean</th>
+                                <th className="text-right p-2">Std</th>
+                                <th className="text-right p-2">Min</th>
+                                <th className="text-right p-2">Max</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {Object.entries(previewData.feature_stats).slice(0, 10).map(([feature, stats]) => (
+                                <tr key={feature} className="border-b border-gray-800 hover:bg-gray-700/30">
+                                  <td className="p-2 font-medium text-cyan-300">{feature}</td>
+                                  <td className="p-2 text-right">{stats?.mean?.toFixed(4) ?? 'N/A'}</td>
+                                  <td className="p-2 text-right text-gray-400">{stats?.std?.toFixed(4) ?? 'N/A'}</td>
+                                  <td className="p-2 text-right text-green-400">{stats?.min?.toFixed(4) ?? 'N/A'}</td>
+                                  <td className="p-2 text-right text-red-400">{stats?.max?.toFixed(4) ?? 'N/A'}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Recent Samples Table */}
                     <div className="bg-gray-800/50 rounded-xl p-4 border border-gray-700">
                       <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
-                        <TrendingUp className="w-5 text-purple-400" />
-                        Feature Statistics (Top 10)
+                        <Table className="w-5 text-cyan-400" />
+                        Recent Samples ({previewData.samples?.length || 0} of {previewData.total_samples})
                       </h3>
-                      <div className="overflow-x-auto">
-                        <table className="w-full text-sm">
-                          <thead>
-                            <tr className="border-b border-gray-700 text-gray-400">
-                              <th className="text-left p-2">Feature</th>
-                              <th className="text-right p-2">Mean</th>
-                              <th className="text-right p-2">Std</th>
-                              <th className="text-right p-2">Min</th>
-                              <th className="text-right p-2">Max</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {Object.entries(previewData.feature_stats).slice(0, 10).map(([feature, stats]) => (
-                              <tr key={feature} className="border-b border-gray-800 hover:bg-gray-700/30">
-                                <td className="p-2 font-medium text-cyan-300">{feature}</td>
-                                <td className="p-2 text-right">{stats?.mean?.toFixed(4) ?? 'N/A'}</td>
-                                <td className="p-2 text-right text-gray-400">{stats?.std?.toFixed(4) ?? 'N/A'}</td>
-                                <td className="p-2 text-right text-green-400">{stats?.min?.toFixed(4) ?? 'N/A'}</td>
-                                <td className="p-2 text-right text-red-400">{stats?.max?.toFixed(4) ?? 'N/A'}</td>
+                      {previewData.samples && previewData.samples.length > 0 ? (
+                        <div className="overflow-x-auto max-h-80">
+                          <table className="w-full text-sm">
+                            <thead className="sticky top-0 bg-gray-800">
+                              <tr className="border-b border-gray-700 text-gray-400">
+                                <th className="text-left p-2">#</th>
+                                <th className="text-left p-2">Timestamp</th>
+                                <th className="text-right p-2">RMS</th>
+                                <th className="text-right p-2">Energy</th>
+                                <th className="text-right p-2">Dominant Freq</th>
+                                <th className="text-right p-2">Spike Count</th>
                               </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
+                            </thead>
+                            <tbody>
+                              {previewData.samples.map((sample, idx) => (
+                                <tr key={idx} className="border-b border-gray-800/50 hover:bg-gray-700/30">
+                                  <td className="p-2 text-gray-500">{sample.sample_index ?? idx}</td>
+                                  <td className="p-2 text-gray-300">{sample._timestamp || sample.timestamp || 'N/A'}</td>
+                                  <td className="p-2 text-right text-cyan-300">{sample.stat_rms?.toFixed(4) ?? 'N/A'}</td>
+                                  <td className="p-2 text-right text-purple-300">{sample.stat_energy?.toFixed(4) ?? 'N/A'}</td>
+                                  <td className="p-2 text-right text-yellow-300">{sample.fft_dominant_freq?.toFixed(2) ?? 'N/A'} Hz</td>
+                                  <td className="p-2 text-right text-green-300">{sample.spike_count ?? 'N/A'}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : (
+                        <div className="text-center text-gray-500 py-8">
+                          No samples available for preview
+                        </div>
+                      )}
                     </div>
-                  )}
 
-                  {/* Recent Samples Table */}
-                  <div className="bg-gray-800/50 rounded-xl p-4 border border-gray-700">
-                    <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
-                      <Table className="w-5 text-cyan-400" />
-                      Recent Samples ({previewData.samples?.length || 0} of {previewData.total_samples})
-                    </h3>
-                    {previewData.samples && previewData.samples.length > 0 ? (
-                      <div className="overflow-x-auto max-h-80">
-                        <table className="w-full text-sm">
-                          <thead className="sticky top-0 bg-gray-800">
-                            <tr className="border-b border-gray-700 text-gray-400">
-                              <th className="text-left p-2">#</th>
-                              <th className="text-left p-2">Timestamp</th>
-                              <th className="text-right p-2">RMS</th>
-                              <th className="text-right p-2">Energy</th>
-                              <th className="text-right p-2">Dominant Freq</th>
-                              <th className="text-right p-2">Spike Count</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {previewData.samples.map((sample, idx) => (
-                              <tr key={idx} className="border-b border-gray-800/50 hover:bg-gray-700/30">
-                                <td className="p-2 text-gray-500">{sample.sample_index ?? idx}</td>
-                                <td className="p-2 text-gray-300">{sample._timestamp || sample.timestamp || 'N/A'}</td>
-                                <td className="p-2 text-right text-cyan-300">{sample.stat_rms?.toFixed(4) ?? 'N/A'}</td>
-                                <td className="p-2 text-right text-purple-300">{sample.stat_energy?.toFixed(4) ?? 'N/A'}</td>
-                                <td className="p-2 text-right text-yellow-300">{sample.fft_dominant_freq?.toFixed(2) ?? 'N/A'} Hz</td>
-                                <td className="p-2 text-right text-green-300">{sample.spike_count ?? 'N/A'}</td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    ) : (
-                      <div className="text-center text-gray-500 py-8">
-                        No samples available for preview
+                    {/* File Info */}
+                    {previewData.file_info && (
+                      <div className="bg-gray-800/50 rounded-xl p-4 border border-gray-700">
+                        <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
+                          <Database className="w-5 text-green-400" />
+                          File Information
+                        </h3>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                          <div className="bg-gray-700/30 rounded-lg p-3">
+                            <div className="text-xs text-gray-400 mb-1">CSV Path</div>
+                            <div className="font-medium text-sm truncate" title={previewData.file_info.features_csv?.path}>
+                              {previewData.file_info.features_csv?.path?.split('/').pop() || 'N/A'}
+                            </div>
+                          </div>
+                          <div className="bg-gray-700/30 rounded-lg p-3">
+                            <div className="text-xs text-gray-400 mb-1">File Size</div>
+                            <div className="font-medium">{previewData.file_info.features_csv?.size_kb || 0} KB</div>
+                          </div>
+                          <div className="bg-gray-700/30 rounded-lg p-3">
+                            <div className="text-xs text-gray-400 mb-1">Waveforms</div>
+                            <div className="font-medium">{previewData.waveform_count || 0}</div>
+                          </div>
+                          <div className="bg-gray-700/30 rounded-lg p-3">
+                            <div className="text-xs text-gray-400 mb-1">Columns</div>
+                            <div className="font-medium">{previewData.file_info.features_csv?.columns?.length || 0}</div>
+                          </div>
+                        </div>
                       </div>
                     )}
                   </div>
-
-                  {/* File Info */}
-                  {previewData.file_info && (
-                    <div className="bg-gray-800/50 rounded-xl p-4 border border-gray-700">
-                      <h3 className="text-lg font-bold mb-3 flex items-center gap-2">
-                        <Database className="w-5 text-green-400" />
-                        File Information
-                      </h3>
-                      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                        <div className="bg-gray-700/30 rounded-lg p-3">
-                          <div className="text-xs text-gray-400 mb-1">CSV Path</div>
-                          <div className="font-medium text-sm truncate" title={previewData.file_info.features_csv?.path}>
-                            {previewData.file_info.features_csv?.path?.split('/').pop() || 'N/A'}
-                          </div>
-                        </div>
-                        <div className="bg-gray-700/30 rounded-lg p-3">
-                          <div className="text-xs text-gray-400 mb-1">File Size</div>
-                          <div className="font-medium">{previewData.file_info.features_csv?.size_kb || 0} KB</div>
-                        </div>
-                        <div className="bg-gray-700/30 rounded-lg p-3">
-                          <div className="text-xs text-gray-400 mb-1">Waveforms</div>
-                          <div className="font-medium">{previewData.waveform_count || 0}</div>
-                        </div>
-                        <div className="bg-gray-700/30 rounded-lg p-3">
-                          <div className="text-xs text-gray-400 mb-1">Columns</div>
-                          <div className="font-medium">{previewData.file_info.features_csv?.columns?.length || 0}</div>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="text-center text-gray-500 py-8">
-                  No data available
-                </div>
-              )}
+                ) : (
+                  <div className="text-center text-gray-500 py-8">
+                    No data available
+                  </div>
+                )}
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )
+      }
 
       {/* TOAST NOTIFICATIONS */}
       <div className="fixed bottom-6 right-6 z-50 flex flex-col gap-2">
@@ -2797,7 +3401,7 @@ function Vibrations() {
         }
         .animate-slide-in { animation: slide-in 0.3s ease-out; }
       `}</style>
-    </div>
+    </div >
   );
 }
 
