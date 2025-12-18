@@ -15,14 +15,15 @@
 import { Mp3Encoder } from '@breezystack/lamejs';
 
 // Use local API for development, remote for production
-const USE_LOCAL_API = true; // Set to false for production
+// Use local API for development, remote for production
+const USE_LOCAL_API = true; // Using local API for development
 
 const API_BASE = USE_LOCAL_API
     ? "http://localhost:8000"
-    : "https://ai-voice-detection-9lne.onrender.com";
+    : "https://ai-voice-detection-3.onrender.com";
 const WS_BASE = USE_LOCAL_API
     ? "ws://localhost:8000"
-    : "wss://ai-voice-detection-9lne.onrender.com";
+    : "wss://ai-voice-detection-3.onrender.com";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 🔧 UTILITY FUNCTIONS
@@ -173,6 +174,7 @@ const resampleAudio = (samples, fromRate, toRate) => {
 
 /**
  * Record audio from microphone and convert to WAV
+ * Uses AudioContext for reliable cross-browser WAV generation
  * @param {number} durationMs - Duration in milliseconds
  * @returns {Promise<Blob>} WAV Audio blob
  */
@@ -184,17 +186,18 @@ export const recordAudio = (durationMs = 3000) => {
                     channelCount: 1,
                     echoCancellation: true,
                     noiseSuppression: true,
-                    autoGainControl: true
+                    autoGainControl: true,
+                    sampleRate: 16000
                 }
             });
 
-            // Use browser's native sample rate
             const audioContext = new (window.AudioContext || window.webkitAudioContext)();
             const sampleRate = audioContext.sampleRate;
-            console.log('🎙️ Recording at:', sampleRate, 'Hz');
-
             const source = audioContext.createMediaStreamSource(stream);
-            const processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+            // Use ScriptProcessor (deprecated but reliable for WAV)
+            const bufferSize = 4096;
+            const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
             const audioChunks = [];
 
             processor.onaudioprocess = (e) => {
@@ -210,7 +213,7 @@ export const recordAudio = (durationMs = 3000) => {
                 source.disconnect();
                 stream.getTracks().forEach(track => track.stop());
 
-                // Combine chunks
+                // Combine all chunks
                 const totalLength = audioChunks.reduce((acc, chunk) => acc + chunk.length, 0);
                 const samples = new Float32Array(totalLength);
                 let offset = 0;
@@ -219,38 +222,26 @@ export const recordAudio = (durationMs = 3000) => {
                     offset += chunk.length;
                 }
 
-                // Check audio level
-                let maxLevel = 0;
-                for (let i = 0; i < samples.length; i++) {
-                    const abs = Math.abs(samples[i]);
-                    if (abs > maxLevel) maxLevel = abs;
-                }
-                console.log('📈 Max level:', maxLevel.toFixed(4), '| Samples:', samples.length);
+                console.log(`🎤 Recorded ${samples.length} samples at ${sampleRate}Hz`);
 
-                // Use OfflineAudioContext for high-quality resampling to 16kHz
+                // Resample to 16kHz using OfflineAudioContext
                 const TARGET_RATE = 16000;
                 const duration = samples.length / sampleRate;
                 const offlineCtx = new OfflineAudioContext(1, Math.ceil(duration * TARGET_RATE), TARGET_RATE);
 
-                // Create buffer with original samples
                 const audioBuffer = offlineCtx.createBuffer(1, samples.length, sampleRate);
                 audioBuffer.getChannelData(0).set(samples);
 
-                // Create source and connect
                 const bufferSource = offlineCtx.createBufferSource();
                 bufferSource.buffer = audioBuffer;
                 bufferSource.connect(offlineCtx.destination);
                 bufferSource.start();
 
-                // Render resampled audio
                 offlineCtx.startRendering().then(renderedBuffer => {
                     const resampledSamples = renderedBuffer.getChannelData(0);
-                    console.log('🔄 Resampled:', sampleRate, '→', TARGET_RATE, 'Hz | Samples:', resampledSamples.length);
-
-                    // Create WAV (not MP3 - WAV is more reliable)
+                    console.log(`🎤 Resampled to ${resampledSamples.length} samples at ${TARGET_RATE}Hz`);
                     const wavBlob = float32ToWav(resampledSamples, TARGET_RATE);
-                    console.log('📼 WAV:', wavBlob.size, 'bytes');
-
+                    console.log(`🎤 WAV blob: ${wavBlob.size} bytes`);
                     audioContext.close();
                     resolve(wavBlob);
                 }).catch(err => {
@@ -264,6 +255,7 @@ export const recordAudio = (durationMs = 3000) => {
         }
     });
 };
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 🏥 HEALTH CHECK
@@ -402,13 +394,23 @@ export const enrollUser = async (userId, audioFiles, overwrite = true) => {
  */
 export const authenticateVoice = async (userId, audioBlob, sessionId = null) => {
     try {
+        console.log(`🔊 Authenticating voice for user: ${userId}`);
+        console.log(`🔊 Audio blob: ${audioBlob.size} bytes, type: ${audioBlob.type}`);
+
         const formData = new FormData();
         formData.append('user_id', userId);
-        formData.append('audio', prepareAudioBlob(audioBlob), 'recording.wav');
+
+        // Prepare audio - ensure it's WAV format
+        const preparedBlob = prepareAudioBlob(audioBlob);
+        console.log(`🔊 Prepared blob: ${preparedBlob.size} bytes, type: ${preparedBlob.type}`);
+
+        formData.append('audio', preparedBlob, 'recording.wav');
 
         if (sessionId) {
             formData.append('session_id', sessionId);
         }
+
+        console.log(`🔊 Sending to: ${API_BASE}/api/v1/voice/authenticate`);
 
         const response = await fetch(`${API_BASE}/api/v1/voice/authenticate`, {
             method: 'POST',
@@ -416,6 +418,8 @@ export const authenticateVoice = async (userId, audioBlob, sessionId = null) => 
         });
 
         const data = await response.json();
+        console.log(`🔊 Response status: ${response.status}`);
+        console.log(`🔊 Response data: ${JSON.stringify(data)}`);
 
         if (!response.ok) {
             throw new Error(data.detail || data.message || 'Authentication failed');
@@ -428,7 +432,7 @@ export const authenticateVoice = async (userId, audioBlob, sessionId = null) => 
             message: data.message
         };
     } catch (error) {
-        console.error('Voice authentication failed:', error);
+        console.error('🔊 Voice authentication failed:', error);
         return {
             authenticated: false,
             confidence: 0,
@@ -716,23 +720,23 @@ export const createVoiceStream = (userId, onResult, onStatus, onError) => {
         if (isStreaming) return;
 
         try {
-            // Get microphone access
+            // Get microphone access with optimized settings
             mediaStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     sampleRate: 16000,
                     channelCount: 1,
                     echoCancellation: true,
-                    noiseSuppression: true
+                    noiseSuppression: true,
+                    autoGainControl: true
                 }
             });
 
-            // Create audio context for processing
-            audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                sampleRate: 16000
-            });
+            // Create audio context for processing (with fallback sample rate)
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
             const source = audioContext.createMediaStreamSource(mediaStream);
-            processor = audioContext.createScriptProcessor(4096, 1, 1);
+            // Smaller buffer (2048) = 128ms latency at 16kHz, good balance of performance
+            processor = audioContext.createScriptProcessor(2048, 1, 1);
 
             processor.onaudioprocess = (e) => {
                 if (ws && ws.readyState === WebSocket.OPEN && isStreaming) {
@@ -750,7 +754,7 @@ export const createVoiceStream = (userId, onResult, onStatus, onError) => {
 
         } catch (error) {
             console.error('Failed to start audio streaming:', error);
-            if (onError) onError('Failed to access microphone: ' + error.message);
+            if (onError) onError('Microphone access failed');
         }
     };
 
@@ -872,6 +876,7 @@ export default {
     authenticateVoice,
     startChallenge,
     verifyChallenge,
+    verifyChallengeWithText,
     performChallengeAuth,
     createVoiceStream,
     recordAudio,

@@ -1,5 +1,5 @@
 import { Link, useLocation, useNavigate } from 'react-router-dom';
-import { Sun, Moon, Menu, Activity, LogOut } from 'lucide-react';
+import { Menu, LogOut, Activity, Bell, Settings, User, ChevronDown } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
 import { logoutUser } from '../utils/authActions';
 import { useState } from 'react';
@@ -12,83 +12,129 @@ function Navbar({ darkMode, setDarkMode, setSidebarOpen }) {
 
   const isActive = (path) => location.pathname === path;
 
+  const navItems = [
+    { path: "/", label: "Dashboard", icon: "◈" },
+    { path: "/vibrations", label: "Sensors", icon: "◉" },
+    { path: "/notifications", label: "Alerts", icon: "◎" },
+    { path: "/tracking", label: "Tracking", icon: "◇" },
+  ];
+
   return (
-    <nav className="bg-white dark:bg-gray-800 shadow-lg sticky top-0 z-40 transition-colors duration-300">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+    <nav className="nav-tech sticky top-0 z-40">
+      <div className="max-w-[1600px] mx-auto px-6">
         <div className="flex justify-between items-center h-16">
 
-          {/* LEFT */}
-          <div className="flex items-center space-x-3">
+          {/* LEFT - Logo & Menu */}
+          <div className="flex items-center gap-4">
             <button
               onClick={() => setSidebarOpen(true)}
-              className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+              className="p-2 rounded-lg border border-slate-800 hover:border-cyan-500/30 transition-all hover:bg-cyan-500/5"
             >
-              <Menu className="w-6 h-6 text-gray-700 dark:text-gray-300" />
+              <Menu className="w-5 h-5 text-slate-400" />
             </button>
 
-            <Link to="/" className="flex items-center space-x-2">
-              <Activity className="w-8 h-8 text-blue-600 dark:text-blue-400" />
-              <span className="text-2xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-600 to-cyan-600 dark:from-blue-300 dark:to-cyan-300">
-                SynapSense
-              </span>
+            <Link to="/" className="flex items-center gap-3 group">
+              <div className="relative">
+                <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center">
+                  <Activity className="w-5 h-5 text-black" />
+                </div>
+                <div className="absolute -top-1 -right-1 w-3 h-3 rounded-full bg-green-500 border-2 border-slate-950 animate-pulse" />
+              </div>
+              <div>
+                <span className="text-xl font-bold text-gradient tracking-tight">SYNAPSENSE</span>
+                <div className="text-[9px] text-slate-500 tracking-[0.3em] -mt-1">SECURITY PLATFORM</div>
+              </div>
             </Link>
           </div>
 
-          {/* CENTER NAV LINKS */}
-          <div className="hidden md:flex items-center space-x-2">
-            {[
-              { path: "/", label: "Home" },
-              { path: "/vibrations", label: "Vibrations" },
-              { path: "/notifications", label: "Notifications" },
-              { path: "/faqs", label: "FAQs" },
-              { path: "/about", label: "About" },
-              { path: "/tracking", label: "Tracking" },
-            ].map((item) => (
+          {/* CENTER - Navigation */}
+          <div className="hidden lg:flex items-center gap-1 bg-slate-900/50 px-2 py-1 rounded-lg border border-slate-800">
+            {navItems.map((item) => (
               <Link
                 key={item.path}
                 to={item.path}
-                className={`px-4 py-2 rounded-lg font-medium transition-all ${isActive(item.path)
-                    ? 'bg-blue-600 text-white shadow-lg'
-                    : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'
+                className={`px-4 py-2 rounded-md text-xs font-medium tracking-wider transition-all flex items-center gap-2 ${isActive(item.path)
+                    ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-800'
                   }`}
               >
-                {item.label}
+                <span className="text-sm opacity-60">{item.icon}</span>
+                {item.label.toUpperCase()}
               </Link>
             ))}
           </div>
 
-          {/* RIGHT SIDE */}
-          <div className="flex items-center gap-4">
-            {/* Dark Mode Toggle */}
-            <button
-              onClick={() => setDarkMode(!darkMode)}
-              className="p-2 rounded-lg bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600"
-            >
-              {darkMode ? <Sun className="w-5 h-5 text-yellow-400" /> : <Moon className="w-5 h-5 text-gray-700" />}
+          {/* RIGHT - Actions */}
+          <div className="flex items-center gap-3">
+            {/* Quick Stats */}
+            <div className="hidden md:flex items-center gap-4 mr-4 text-xs">
+              <div className="flex items-center gap-2">
+                <div className="status-dot online" />
+                <span className="text-slate-400">SYSTEM ACTIVE</span>
+              </div>
+            </div>
+
+            {/* Notifications */}
+            <button className="relative p-2 rounded-lg border border-slate-800 hover:border-cyan-500/30 transition-all hover:bg-cyan-500/5">
+              <Bell className="w-5 h-5 text-slate-400" />
+              <div className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-red-500 flex items-center justify-center text-[10px] font-bold text-white">3</div>
             </button>
+
+            {/* Settings */}
+            <Link to="/settings" className="p-2 rounded-lg border border-slate-800 hover:border-cyan-500/30 transition-all hover:bg-cyan-500/5">
+              <Settings className="w-5 h-5 text-slate-400" />
+            </Link>
 
             {/* User Profile */}
             {user && (
               <div className="relative">
-                <img
-                  src={user.photoURL || "/placeholder.jpg"}
-                  alt="profile"
+                <button
                   onClick={() => setMenuOpen(!menuOpen)}
-                  className="w-10 h-10 rounded-full cursor-pointer border-2 border-blue-500"
-                />
+                  className="flex items-center gap-2 py-1 pl-1 pr-3 rounded-lg border border-slate-800 hover:border-cyan-500/30 transition-all hover:bg-cyan-500/5"
+                >
+                  <div className="w-8 h-8 rounded-md bg-gradient-to-br from-purple-500 to-blue-500 flex items-center justify-center">
+                    {user.photoURL ? (
+                      <img src={user.photoURL} alt="" className="w-full h-full object-cover rounded-md" />
+                    ) : (
+                      <User className="w-4 h-4 text-white" />
+                    )}
+                  </div>
+                  <div className="hidden sm:block text-left">
+                    <div className="text-xs font-medium text-slate-200">{user.displayName?.split(' ')[0] || 'User'}</div>
+                    <div className="text-[10px] text-slate-500">OPERATOR</div>
+                  </div>
+                  <ChevronDown className="w-4 h-4 text-slate-500" />
+                </button>
 
                 {/* Dropdown */}
                 {menuOpen && (
-                  <div className="absolute right-0 mt-3 bg-white dark:bg-gray-700 px-4 py-3 shadow-xl rounded-lg w-52">
-                    <p className="font-semibold text-gray-800 dark:text-gray-100">{user.displayName || "User"}</p>
-                    <p className="text-xs text-gray-500 dark:text-gray-400">{user.email}</p>
+                  <div className="absolute right-0 mt-2 w-64 card-tech p-2 animate-fadeIn z-50">
+                    <div className="px-3 py-3 border-b border-slate-800">
+                      <div className="text-xs text-slate-500 tracking-wider mb-1">SIGNED IN AS</div>
+                      <div className="text-sm font-medium text-white">{user.displayName || "User"}</div>
+                      <div className="text-xs text-slate-400">{user.email}</div>
+                    </div>
 
-                    <button
-                      onClick={() => logoutUser(navigate)}
-                      className="mt-3 flex items-center gap-2 text-sm text-white bg-red-500 hover:bg-red-600 w-full px-3 py-2 rounded-lg"
-                    >
-                      <LogOut className="w-4" /> Logout
-                    </button>
+                    <div className="py-2 space-y-1">
+                      <Link to="/profile" className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-slate-800 transition-all">
+                        <User className="w-4 h-4 text-slate-400" />
+                        <span className="text-sm text-slate-300">Profile Settings</span>
+                      </Link>
+                      <Link to="/settings" className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-slate-800 transition-all">
+                        <Settings className="w-4 h-4 text-slate-400" />
+                        <span className="text-sm text-slate-300">System Settings</span>
+                      </Link>
+                    </div>
+
+                    <div className="pt-2 border-t border-slate-800">
+                      <button
+                        onClick={() => { logoutUser(navigate); setMenuOpen(false); }}
+                        className="flex items-center gap-3 w-full px-3 py-2 rounded-lg hover:bg-red-500/10 transition-all group"
+                      >
+                        <LogOut className="w-4 h-4 text-red-400" />
+                        <span className="text-sm text-red-400">Sign Out</span>
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>

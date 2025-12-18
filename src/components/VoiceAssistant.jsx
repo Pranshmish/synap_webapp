@@ -1,898 +1,688 @@
-import { useRef, useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import {
-  checkAPIHealth,
-  startChallenge,
-  verifyChallenge,
-  verifyChallengeWithText,
-  recordAudio,
-  enrollUser,
-  createVoiceStream,
-  VoiceAuthSession
+    checkAPIHealth,
+    enrollUser,
+    authenticateVoice,
+    recordAudio,
+    startChallenge,
+    verifyChallengeWithText,
 } from "../utils/voiceAuthService";
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// 📚 SYNAPSENSE KNOWLEDGE BASE
-// ═══════════════════════════════════════════════════════════════════════════════
-const KNOWLEDGE_BASE = [
-  {
-    topic: "what_is_synapsense",
-    keywords: ["what", "synapsense", "what is", "explain", "tell me about", "describe"],
-    question: "What is SynapSense?",
-    answer: "SynapSense is a cutting-edge vibration-based detection and monitoring system that uses advanced seismic sensor technology to provide comprehensive security and surveillance capabilities.",
-    shortAnswer: "SynapSense is an advanced vibration-based security system using seismic sensors.",
-    category: "overview"
-  },
-  {
-    topic: "how_it_works",
-    keywords: ["how", "work", "works", "working", "function", "operate"],
-    question: "How does SynapSense work?",
-    answer: "SynapSense uses high-sensitivity geophone sensors that detect micro-vibrations. The system processes data using FFT analysis and machine learning algorithms to distinguish threats from noise.",
-    shortAnswer: "Uses seismic sensors and ML to detect and classify vibrations in real-time.",
-    category: "technology"
-  },
-  {
-    topic: "benefits",
-    keywords: ["benefit", "benefits", "advantage", "why use", "useful"],
-    question: "What are the benefits?",
-    answer: "Key benefits: 24/7 automated surveillance, works in darkness and bad weather, invisible to intruders, low false alarm rates with AI classification, and remote monitoring capability.",
-    shortAnswer: "24/7 invisible surveillance in any condition with minimal false alarms.",
-    category: "overview"
-  },
-  {
-    topic: "accuracy",
-    keywords: ["accuracy", "accurate", "precision", "reliable", "detection rate"],
-    question: "How accurate is SynapSense?",
-    answer: "SynapSense maintains 98.7% detection accuracy using pattern recognition, frequency analysis, and continuous ML improvements.",
-    shortAnswer: "98.7% detection accuracy with ML-based validation.",
-    category: "technology"
-  },
-  {
-    topic: "voice_auth",
-    keywords: ["voice", "authentication", "voice auth", "verify", "enroll", "biometric"],
-    question: "About voice authentication",
-    answer: "Voice authentication uses AI to verify your identity. First enroll your voice by saying 3 sample phrases, then verify by speaking a challenge phrase. This prevents replay attacks.",
-    shortAnswer: "AI voice auth with enrollment and challenge-response verification.",
-    category: "security"
-  },
-  {
-    topic: "greeting",
-    keywords: ["hello", "hi", "hey", "greetings", "good morning"],
-    question: "Hello!",
-    answer: "Hello! I'm SynapSense Voice Assistant with biometric authentication. Say 'enroll my voice' to register, or 'verify my voice' to authenticate. After verification, you can navigate the app with voice commands!",
-    shortAnswer: "Hello! Enroll your voice first, then verify to use navigation.",
-    category: "greeting"
-  },
-  {
-    topic: "help",
-    keywords: ["help", "what can you do", "commands", "guide"],
-    question: "Help",
-    answer: "Available commands:\n🔐 'Enroll my voice' - Register your voiceprint (3 samples)\n🔑 'Verify my voice' - Authenticate with challenge phrase\n📍 'Open dashboard/vibrations/settings' - Navigate (after verification)\n❓ Ask any question about SynapSense",
-    shortAnswer: "Enroll → Verify → Navigate. Ask questions anytime!",
-    category: "support"
-  }
-];
-
-const SUGGESTED_ACTIONS = [
-  { text: "Enroll my voice", category: "auth", icon: "🎤" },
-  { text: "Verify my voice", category: "auth", icon: "🔐" },
-  { text: "What is SynapSense?", category: "qa", icon: "❓" },
-  { text: "Help", category: "support", icon: "💡" },
-];
 
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
-// Enrollment phrases for user to speak
 const ENROLLMENT_PHRASES = [
-  "My voice is my password",
-  "Security through sound waves",
-  "SynapSense protects my home"
+    "My voice is my password",
+    "SynapSense keeps me safe",
+    "Home sweet home"
 ];
 
+// Storage helpers
+const getOwnerPassword = () => localStorage.getItem("synap_owner_password");
+const setOwnerPassword = (pin) => localStorage.setItem("synap_owner_password", pin);
+const hasOwnerPassword = () => !!getOwnerPassword();
+const verifyOwnerPassword = (input) => getOwnerPassword() === input;
+const getOwners = () => JSON.parse(localStorage.getItem("synap_owners") || '["owner"]');
+const getEnrolledOwners = () => JSON.parse(localStorage.getItem("synap_enrolled_owners") || '[]');
+const setEnrolledOwners = (owners) => localStorage.setItem("synap_enrolled_owners", JSON.stringify(owners));
+const markOwnerEnrolled = (name) => {
+    const enrolled = getEnrolledOwners();
+    if (!enrolled.includes(name)) { enrolled.push(name); setEnrolledOwners(enrolled); }
+};
+const addOwner = (name) => {
+    const owners = getOwners();
+    if (!owners.includes(name)) { owners.push(name); localStorage.setItem("synap_owners", JSON.stringify(owners)); }
+};
+const removeOwner = (name) => {
+    if (name === "owner") return false;
+    localStorage.setItem("synap_owners", JSON.stringify(getOwners().filter(o => o !== name)));
+    setEnrolledOwners(getEnrolledOwners().filter(o => o !== name));
+    return true;
+};
+
 export default function VoiceAssistant() {
-  const navigate = useNavigate();
-  const recognitionRef = useRef(null);
-  const answerPanelRef = useRef(null);
-  const lastTranscriptRef = useRef("");
-  const listeningTimeoutRef = useRef(null);
-  const hasProcessedRef = useRef(false);
-  const voiceStreamRef = useRef(null);
-  const authSessionRef = useRef(null);
-  const enrollmentSamplesRef = useRef([]); // Use ref to collect samples during async enrollment
+    const navigate = useNavigate();
+    const recognitionRef = useRef(null);
+    const enrollmentInProgressRef = useRef(false);
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 🎯 STATE MANAGEMENT
-  // ═══════════════════════════════════════════════════════════════════════════
-  const [isListening, setIsListening] = useState(false);
-  const [isPanelOpen, setIsPanelOpen] = useState(false);
-  const [currentTranscript, setCurrentTranscript] = useState("");
-  const [textInput, setTextInput] = useState("");
-  const [status, setStatus] = useState("idle");
-  const [conversationHistory, setConversationHistory] = useState([]);
-  const [isSpeaking, setIsSpeaking] = useState(false);
+    const [isPanelOpen, setIsPanelOpen] = useState(false);
+    const [voiceAuthStatus, setVoiceAuthStatus] = useState("unknown");
+    const [status, setStatus] = useState("idle");
+    const [statusMessage, setStatusMessage] = useState("");
+    const [liveTranscript, setLiveTranscript] = useState("");
 
-  // Voice Auth State
-  const [voiceAuthStatus, setVoiceAuthStatus] = useState("unknown");
-  const [isEnrolled, setIsEnrolled] = useState(false);
-  const [isVerified, setIsVerified] = useState(false);
-  const [challengePhrase, setChallengePhrase] = useState("");
-  const [authScore, setAuthScore] = useState(0);
+    const [isEnrolled, setIsEnrolled] = useState(false);
+    const [isVerified, setIsVerified] = useState(false);
+    const [currentUser, setCurrentUser] = useState(null);
+    const [enrolledOwners, setEnrolledOwnersState] = useState([]);
+    const [owners, setOwnersState] = useState([]);
 
-  // Enrollment State
-  const [isEnrolling, setIsEnrolling] = useState(false);
-  const [enrollmentStep, setEnrollmentStep] = useState(0);
-  const [enrollmentSamples, setEnrollmentSamples] = useState([]);
-  const [currentEnrollPhrase, setCurrentEnrollPhrase] = useState("");
+    const [isEnrolling, setIsEnrolling] = useState(false);
+    const [enrollmentStep, setEnrollmentStep] = useState(0);
+    const [currentEnrollPhrase, setCurrentEnrollPhrase] = useState("");
 
-  // Get user ID from localStorage or use 'owner' as default (to match enrolled voiceprint)
-  const userId = localStorage.getItem("voice_user_id") || (() => {
-    // Use 'owner' as default since that's the enrolled user
-    const id = "owner";
-    localStorage.setItem("voice_user_id", id);
-    return id;
-  })();
+    const [showPinModal, setShowPinModal] = useState(false);
+    const [pinModalMode, setPinModalMode] = useState("setup");
+    const [pinValue, setPinValue] = useState("");
+    const [pinConfirmValue, setPinConfirmValue] = useState("");
+    const [pinError, setPinError] = useState("");
+    const [pendingAction, setPendingAction] = useState(null);
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 🔌 INITIALIZE ON MOUNT
-  // ═══════════════════════════════════════════════════════════════════════════
-  useEffect(() => {
-    const init = async () => {
-      // Check API health
-      const health = await checkAPIHealth();
-      if (health.ready) {
-        setVoiceAuthStatus("ready");
-        console.log("✅ Voice Auth API ready:", health);
-      } else {
-        setVoiceAuthStatus("error");
-        console.warn("⚠️ Voice Auth API not ready:", health);
-      }
+    const [showOwnerModal, setShowOwnerModal] = useState(false);
+    const [newOwnerName, setNewOwnerName] = useState("");
 
-      // Check if already enrolled (stored in localStorage)
-      const enrolled = localStorage.getItem("voice_enrolled") === "true";
-      setIsEnrolled(enrolled);
+    const getUserId = (ownerName = "owner") => `voice_${ownerName}`;
 
-      // Initialize auth session
-      authSessionRef.current = new VoiceAuthSession(userId);
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INITIALIZATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    useEffect(() => {
+        const init = async () => {
+            try {
+                const health = await checkAPIHealth();
+                setVoiceAuthStatus(health.ready ? "ready" : "error");
+            } catch {
+                setVoiceAuthStatus("error");
+            }
+            setEnrolledOwnersState(getEnrolledOwners());
+            setOwnersState(getOwners());
+            setIsEnrolled(getEnrolledOwners().length > 0);
+        };
+        init();
+    }, []);
+
+    const speak = useCallback((text) => {
+        speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = "en-US";
+        u.rate = 1.0;
+        speechSynthesis.speak(u);
+    }, []);
+
+    const updateStatus = (s, msg = "") => { setStatus(s); setStatusMessage(msg); };
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // VOICE IDENTIFICATION - Check speaker against ALL enrolled users
+    // ═══════════════════════════════════════════════════════════════════════════
+    const identifyVoice = async (audioBlob) => {
+        const enrolled = getEnrolledOwners();
+        console.log("🎯 Voice identification starting...");
+
+        if (enrolled.length === 0) {
+            console.log("🎯 No enrolled users - allowing");
+            return { identified: true, user: null, score: 1.0 };
+        }
+
+        if (!audioBlob || audioBlob.size < 1000) {
+            console.log("🎯 Invalid audio:", audioBlob?.size || 0, "bytes");
+            return { identified: false, user: null, score: 0, error: "No audio" };
+        }
+
+        let bestMatch = { user: null, score: 0, authenticated: false, decision: "" };
+
+        for (const owner of enrolled) {
+            try {
+                console.log(`🎯 Checking: ${owner}`);
+                const result = await authenticateVoice(getUserId(owner), audioBlob);
+                console.log(`🎯 ${owner}: auth=${result.authenticated}, score=${result.confidence?.toFixed(2)}, decision=${result.decision}`);
+
+                if (result.decision === "NOT_ENROLLED") continue;
+
+                if (result.authenticated && result.confidence > bestMatch.score) {
+                    bestMatch = { user: owner, score: result.confidence, authenticated: true, decision: result.decision };
+                } else if (!bestMatch.authenticated && result.confidence > bestMatch.score) {
+                    bestMatch = { user: owner, score: result.confidence, authenticated: false, decision: result.decision };
+                }
+            } catch (e) {
+                console.error(`🎯 Error checking ${owner}:`, e);
+            }
+        }
+
+        console.log("🎯 Best match:", bestMatch);
+        return { identified: bestMatch.authenticated, user: bestMatch.user, score: bestMatch.score, decision: bestMatch.decision };
     };
 
-    init();
-
-    return () => {
-      if (voiceStreamRef.current) voiceStreamRef.current.disconnect();
-    };
-  }, [userId]);
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 🔊 SPEAK
-  // ═══════════════════════════════════════════════════════════════════════════
-  const stopSpeaking = useCallback(() => {
-    if (speechSynthesis.speaking) {
-      speechSynthesis.cancel();
-      setIsSpeaking(false);
-      setStatus("idle");
-    }
-  }, []);
-
-  const speak = useCallback((text) => {
-    speechSynthesis.cancel();
-    setStatus("speaking");
-    setIsSpeaking(true);
-
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = "en-US";
-    utterance.rate = 1.0;
-    utterance.pitch = 1.0;
-
-    utterance.onend = () => {
-      setStatus("idle");
-      setIsSpeaking(false);
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PIN MODAL
+    // ═══════════════════════════════════════════════════════════════════════════
+    const openPinModal = (mode, action = null) => {
+        setPinModalMode(mode);
+        setPinValue("");
+        setPinConfirmValue("");
+        setPinError("");
+        setPendingAction(() => action);
+        setShowPinModal(true);
     };
 
-    utterance.onerror = () => {
-      setStatus("idle");
-      setIsSpeaking(false);
+    const handlePinSubmit = () => {
+        if (pinValue.length !== 4 || !/^\d{4}$/.test(pinValue)) { setPinError("4 digits required"); return; }
+        if (pinModalMode === "setup") {
+            if (pinConfirmValue !== pinValue) { setPinError("PIN mismatch"); return; }
+            setOwnerPassword(pinValue);
+        } else {
+            if (!verifyOwnerPassword(pinValue)) { setPinError("Invalid PIN"); return; }
+        }
+        setShowPinModal(false);
+        if (pendingAction) setTimeout(pendingAction, 200);
     };
 
-    speechSynthesis.speak(utterance);
-  }, []);
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ENROLLMENT - Create voice profile
+    // ═══════════════════════════════════════════════════════════════════════════
+    const startEnrollment = useCallback((ownerName = "owner") => {
+        if (voiceAuthStatus !== "ready") { updateStatus("error", "OFFLINE"); return; }
+        if (!hasOwnerPassword()) openPinModal("setup", () => runEnrollment(ownerName));
+        else openPinModal("verify", () => runEnrollment(ownerName));
+    }, [voiceAuthStatus]);
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 🎤 VOICE ENROLLMENT FLOW
-  // ═══════════════════════════════════════════════════════════════════════════
-  const startEnrollment = useCallback(async () => {
-    if (voiceAuthStatus !== "ready") {
-      addMessage("assistant", "⚠️ Voice service not available. Please try later.", true);
-      return;
-    }
+    const runEnrollment = async (ownerName) => {
+        if (enrollmentInProgressRef.current) return;
+        enrollmentInProgressRef.current = true;
+        setIsEnrolling(true);
+        setEnrollmentStep(0);
 
-    setIsEnrolling(true);
-    setEnrollmentStep(0);
-    setEnrollmentSamples([]);
-    enrollmentSamplesRef.current = []; // Reset ref
+        updateStatus("enrolling", `INITIALIZING ${ownerName.toUpperCase()}`);
+        speak("Voice enrollment started. Repeat each phrase after me.");
+        await new Promise(r => setTimeout(r, 3500));
 
-    addMessage("assistant", "🎤 Starting Voice Enrollment!\n\nI'll ask you to speak 3 phrases. Speak clearly after each prompt.", false, true);
-    speak("Starting voice enrollment. I'll ask you to speak 3 phrases.");
+        const samples = [];
+        for (let step = 0; step < ENROLLMENT_PHRASES.length; step++) {
+            const phrase = ENROLLMENT_PHRASES[step];
+            setCurrentEnrollPhrase(phrase);
+            setEnrollmentStep(step + 1);
+            updateStatus("enrolling", `SAY: "${phrase}"`);
+            speak(phrase);
+            await new Promise(r => setTimeout(r, 3500));
 
-    await new Promise(r => setTimeout(r, 2500));
+            updateStatus("recording", "RECORDING...");
+            try {
+                const audioBlob = await recordAudio(4000);
+                samples.push(audioBlob);
+                updateStatus("processing", `SAMPLE ${step + 1}/3 ✓`);
+                await new Promise(r => setTimeout(r, 1000));
+            } catch (error) {
+                updateStatus("error", error.message);
+                setIsEnrolling(false);
+                enrollmentInProgressRef.current = false;
+                return;
+            }
+        }
 
-    // Collect all 3 samples sequentially
-    const samples = [];
-    for (let step = 0; step < ENROLLMENT_PHRASES.length; step++) {
-      const phrase = ENROLLMENT_PHRASES[step];
-      setCurrentEnrollPhrase(phrase);
-      setEnrollmentStep(step + 1);
+        setCurrentEnrollPhrase("");
+        updateStatus("processing", "CREATING VOICEPRINT...");
 
-      addMessage("assistant", `📢 Sample ${step + 1}/3 - Please say:\n"${phrase}"`, false, true);
-      speak(`Sample ${step + 1}. Please say: ${phrase}`);
+        try {
+            const result = await enrollUser(getUserId(ownerName), samples, true);
+            if (result.success) {
+                markOwnerEnrolled(ownerName);
+                setEnrolledOwnersState(getEnrolledOwners());
+                setIsEnrolled(true);
+                updateStatus("success", "VOICEPRINT CREATED");
+                speak("Voiceprint created successfully.");
+            } else {
+                updateStatus("error", result.message);
+            }
+        } catch (error) {
+            updateStatus("error", error.message);
+        }
 
-      await new Promise(r => setTimeout(r, 3000));
-
-      // Record the sample
-      addMessage("assistant", "🎙️ Recording... Speak now!", false, true);
-      setStatus("listening");
-
-      try {
-        const audioBlob = await recordAudio(5000); // 5 seconds for better sample
-        samples.push(audioBlob);
-        enrollmentSamplesRef.current.push(audioBlob);
-        console.log(`📼 Sample ${step + 1} recorded:`, audioBlob.size, 'bytes');
-
-        addMessage("assistant", `✅ Sample ${step + 1} recorded!`, false, true);
-        await new Promise(r => setTimeout(r, 1000));
-      } catch (error) {
-        addMessage("assistant", `❌ Recording failed: ${error.message}`, true);
+        setTimeout(() => updateStatus("idle", ""), 3000);
         setIsEnrolling(false);
-        setStatus("idle");
-        return;
-      }
-    }
+        enrollmentInProgressRef.current = false;
+    };
 
-    // All samples collected - now enroll
-    setCurrentEnrollPhrase("");
-    addMessage("assistant", "🔄 Processing your voice samples...", false, true);
-    setStatus("processing");
+    // ═══════════════════════════════════════════════════════════════════════════
+    // AUTHENTICATION - Verify identity with challenge phrase
+    // ═══════════════════════════════════════════════════════════════════════════
+    const performVerification = useCallback(async () => {
+        if (!isEnrolled) { updateStatus("error", "NO VOICEPRINT"); speak("Please create a voiceprint first"); return; }
 
-    try {
-      console.log('📤 Sending enrollment with', samples.length, 'samples');
-      const result = await enrollUser(userId, samples, true);
+        const userId = getUserId(enrolledOwners[0] || "owner");
+        updateStatus("verifying", "STARTING...");
 
-      if (result.success) {
-        setIsEnrolled(true);
-        localStorage.setItem("voice_enrolled", "true");
+        try {
+            const challenge = await startChallenge(userId);
+            if (!challenge.success) throw new Error(challenge.message);
 
-        addMessage("assistant", `✅ Voice Enrollment Complete!\n\n${result.message}\n\nNow say "Verify my voice" to authenticate.`, false, true, true);
-        speak("Voice enrollment complete! You can now verify your voice to access navigation features.");
-      } else {
-        addMessage("assistant", `❌ Enrollment failed: ${result.message}`, true);
-      }
-    } catch (error) {
-      addMessage("assistant", `❌ Enrollment error: ${error.message}`, true);
-    }
+            updateStatus("challenge", `SAY: "${challenge.phrase}"`);
+            speak(challenge.phrase);
+            await new Promise(r => setTimeout(r, 3000));
 
-    setIsEnrolling(false);
-    setStatus("idle");
-  }, [voiceAuthStatus, speak, userId]);
+            updateStatus("listening", "🎤 SPEAK NOW");
+            console.log("🎙️ Challenge:", challenge.phrase);
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 🔐 VOICE VERIFICATION (Challenge-Response)
-  // ═══════════════════════════════════════════════════════════════════════════
-  const performVoiceAuth = useCallback(async () => {
-    if (!isEnrolled) {
-      addMessage("assistant", "⚠️ You need to enroll your voice first!\n\nSay 'Enroll my voice' to register your voiceprint.", true);
-      speak("Please enroll your voice first by saying: Enroll my voice");
-      return;
-    }
+            // Record audio for verification
+            let audioBlob = null;
+            let spokenText = "";
 
-    if (voiceAuthStatus !== "ready") {
-      addMessage("assistant", "⚠️ Voice authentication service not available.", true);
-      return;
-    }
+            // Start recording
+            const recordPromise = recordAudio(5000);
 
-    setStatus("authenticating");
-    addMessage("assistant", "🔐 Starting voice verification...", false, true);
+            // Use STT if available
+            if (SpeechRecognition) {
+                const recognition = new SpeechRecognition();
+                recognition.lang = "en-US";
+                recognition.continuous = false;
+                recognition.interimResults = true;
 
-    try {
-      // Step 1: Start challenge
-      const challenge = await startChallenge(userId);
+                recognition.onresult = (e) => {
+                    for (let i = e.resultIndex; i < e.results.length; i++) {
+                        if (e.results[i].isFinal) {
+                            spokenText = e.results[i][0].transcript;
+                            console.log("🎙️ Heard:", spokenText);
+                        } else {
+                            setLiveTranscript(e.results[i][0].transcript);
+                        }
+                    }
+                };
+                recognition.onerror = () => { };
+                recognition.start();
 
-      if (!challenge.success) {
-        throw new Error(challenge.message || "Failed to start challenge");
-      }
+                // Wait for recording
+                audioBlob = await recordPromise;
+                console.log("🎙️ Recorded:", audioBlob?.size, "bytes");
 
-      // Step 2: Show phrase
-      setChallengePhrase(challenge.phrase);
-      addMessage("assistant", `📢 Challenge Phrase:\n\n"${challenge.phrase}"\n\nSpeak this phrase clearly!`, false, true);
-      speak(`Please say: ${challenge.phrase}`);
+                try { recognition.stop(); } catch { }
+                await new Promise(r => setTimeout(r, 500));
+            } else {
+                audioBlob = await recordPromise;
+            }
 
-      await new Promise(r => setTimeout(r, 3000));
+            setLiveTranscript("");
+            updateStatus("processing", "ANALYZING...");
 
-      // Step 3: Record audio AND capture browser STT simultaneously
-      addMessage("assistant", "🎙️ Recording... Speak now!", false, true);
-      setStatus("listening");
+            if (!spokenText) spokenText = challenge.phrase; // Fallback
+            if (!audioBlob || audioBlob.size < 1000) {
+                updateStatus("error", "NO AUDIO DETECTED");
+                speak("No audio detected. Please try again.");
+                return;
+            }
 
-      // Start browser speech recognition
-      let spokenText = "";
-      let interimText = "";
-      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            const result = await verifyChallengeWithText(challenge.sessionId, audioBlob, spokenText);
+            console.log("🎙️ Result:", result);
 
-      if (SpeechRecognition) {
+            if (result.success && result.speakerMatch && result.phraseMatch) {
+                setIsVerified(true);
+                setCurrentUser(enrolledOwners[0] || "owner");
+                updateStatus("verified", "✓ AUTHENTICATED");
+                speak("Identity verified. You can now use voice commands.");
+            } else {
+                const voiceOk = result.speakerMatch;
+                const phraseOk = result.phraseMatch;
+                updateStatus("denied", `VOICE: ${voiceOk ? "✓" : "✗"}\nPHRASE: ${phraseOk ? "✓" : "✗"}`);
+                speak("Authentication failed. Please try again.");
+            }
+        } catch (error) {
+            console.error("🎙️ Error:", error);
+            updateStatus("error", error.message);
+        }
+
+        setTimeout(() => { if (status !== "verified") updateStatus("idle", ""); }, 3000);
+    }, [isEnrolled, enrolledOwners, speak, status]);
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // COMMAND PROCESSING - Execute voice commands with speaker verification
+    // ═══════════════════════════════════════════════════════════════════════════
+    const processCommand = useCallback(async (text, audioBlob = null) => {
+        const t = text.toLowerCase().trim();
+        console.log("📝 Command:", t);
+
+        // === ENROLLMENT COMMANDS ===
+        if (t.includes("enroll")) {
+            const match = t.match(/enroll\s+(\w+)/i);
+            if (match && !["my", "voice", "me"].includes(match[1])) {
+                if (!getOwners().includes(match[1])) { addOwner(match[1]); setOwnersState(getOwners()); }
+                startEnrollment(match[1]);
+            } else startEnrollment("owner");
+            return;
+        }
+
+        // === AUTH COMMANDS ===
+        if (t.includes("verify") || t.includes("authenticate") || t.includes("login") || t.includes("unlock")) {
+            performVerification();
+            return;
+        }
+
+        // === HELP COMMAND ===
+        if (t.includes("help") || t.includes("what can")) {
+            updateStatus("info", "COMMANDS:\n• Home / Dashboard\n• Vibrations / Sensors\n• Notifications\n• Profile\n• Settings");
+            speak("Available commands: home, vibrations, notifications, profile, settings, unlock, enroll, and help.");
+            setTimeout(() => updateStatus("idle", ""), 5000);
+            return;
+        }
+
+        // === RESET COMMAND ===
+        if (t.includes("reset") && t.includes("all")) {
+            localStorage.removeItem("synap_owner_password");
+            localStorage.removeItem("synap_enrolled_owners");
+            localStorage.removeItem("synap_owners");
+            setIsEnrolled(false);
+            setIsVerified(false);
+            setCurrentUser(null);
+            setEnrolledOwnersState([]);
+            setOwnersState(["owner"]);
+            updateStatus("success", "SYSTEM RESET");
+            speak("System has been reset.");
+            setTimeout(() => updateStatus("idle", ""), 2000);
+            return;
+        }
+
+        // === NAVIGATION COMMANDS ===
+        const NAV = [
+            { p: /\b(home|dashboard|main|start)\b/, r: "/", n: "Dashboard" },
+            { p: /\b(vibration|sensor|signal|piezo)\b/, r: "/vibrations", n: "Vibrations" },
+            { p: /\b(notification|alert|message)\b/, r: "/notifications", n: "Notifications" },
+            { p: /\b(profile|account)\b/, r: "/profile", n: "Profile" },
+            { p: /\b(setting|config|option)\b/, r: "/settings", n: "Settings" },
+        ];
+
+        for (const nav of NAV) {
+            if (nav.p.test(t)) {
+                console.log("📝 Match:", nav.n);
+
+                // Must be authenticated first
+                if (!isVerified) {
+                    updateStatus("locked", "🔒 SAY 'UNLOCK' FIRST");
+                    speak("Please say unlock to authenticate.");
+                    setTimeout(() => updateStatus("idle", ""), 3000);
+                    return;
+                }
+
+                // === LIVE VOICE VERIFICATION ===
+                if (enrolledOwners.length > 0 && audioBlob && audioBlob.size > 1000) {
+                    console.log("🔐 Checking speaker...");
+                    updateStatus("verifying", "🔐 VERIFYING VOICE...");
+
+                    try {
+                        const voiceCheck = await identifyVoice(audioBlob);
+                        console.log("🔐 Result:", voiceCheck);
+
+                        if (!voiceCheck.identified) {
+                            const score = Math.round(voiceCheck.score * 100);
+                            updateStatus("denied", `🚫 ACCESS DENIED\nConfidence: ${score}%`);
+                            speak("Access denied. Voice not recognized.");
+                            setTimeout(() => updateStatus("idle", ""), 3000);
+                            return;
+                        }
+
+                        setCurrentUser(voiceCheck.user);
+                        console.log("✅ Verified:", voiceCheck.user);
+                    } catch (error) {
+                        console.error("🔐 Error:", error);
+                        // Fail-open for usability
+                    }
+                }
+
+                // Execute navigation
+                navigate(nav.r);
+                updateStatus("success", `→ ${nav.n.toUpperCase()}`);
+                speak(nav.n);
+                setTimeout(() => updateStatus("idle", ""), 2000);
+                return;
+            }
+        }
+
+        // Unknown command
+        updateStatus("idle", "❓ SAY 'HELP'");
+        setTimeout(() => updateStatus("idle", ""), 2000);
+    }, [isVerified, startEnrollment, performVerification, navigate, speak, enrolledOwners]);
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // VOICE COMMAND LISTENER - STT + Audio Recording
+    // ═══════════════════════════════════════════════════════════════════════════
+    const startListening = useCallback(async () => {
+        if (!SpeechRecognition || isEnrolling) return;
+
+        updateStatus("listening", "🎤 LISTENING...");
+        console.log("🎤 Starting...");
+
+        let audioBlob = null;
+        let sttText = "";
+
+        // Start recording (runs in background)
+        const recordPromise = recordAudio(4000)
+            .then(blob => { audioBlob = blob; console.log("🎤 Recorded:", blob.size, "bytes"); })
+            .catch(err => console.warn("🎤 Record error:", err.message));
+
+        await new Promise(r => setTimeout(r, 100));
+
         const recognition = new SpeechRecognition();
         recognition.lang = "en-US";
-        recognition.continuous = true;
-        recognition.interimResults = true; // Enable real-time updates
+        recognition.continuous = false;
+        recognition.interimResults = true;
 
-        const sttPromise = new Promise((resolve) => {
-          recognition.onresult = (event) => {
-            let finalTranscript = "";
-            let interimTranscript = "";
-
-            for (let i = event.resultIndex; i < event.results.length; i++) {
-              const transcript = event.results[i][0].transcript;
-              if (event.results[i].isFinal) {
-                finalTranscript += transcript;
-              } else {
-                interimTranscript += transcript;
-              }
+        recognition.onresult = (e) => {
+            for (let i = e.resultIndex; i < e.results.length; i++) {
+                if (e.results[i].isFinal) {
+                    sttText = e.results[i][0].transcript;
+                    console.log("🎤 Heard:", sttText);
+                } else {
+                    setLiveTranscript(e.results[i][0].transcript);
+                }
             }
+        };
 
-            if (finalTranscript) {
-              spokenText = finalTranscript;
-              console.log("🎤 Final:", spokenText);
+        recognition.onerror = (e) => {
+            if (e.error === "no-speech") updateStatus("idle", "No speech detected");
+            else if (e.error === "not-allowed") updateStatus("error", "Microphone denied");
+        };
+
+        recognition.onend = async () => {
+            setLiveTranscript("");
+            await recordPromise;
+
+            if (sttText) {
+                console.log("🎤 Processing:", sttText, "Audio:", audioBlob?.size || 0);
+                processCommand(sttText, audioBlob);
+            } else {
+                updateStatus("idle", "");
             }
+        };
 
-            // Show what user is saying in real-time
-            interimText = interimTranscript || finalTranscript;
-            if (interimText) {
-              setCurrentTranscript(`🗣️ "${interimText}"`);
-            }
-          };
-          recognition.onerror = (e) => {
-            console.warn("Browser STT error:", e.error);
-            resolve("");
-          };
-          recognition.onend = () => {
-            resolve(spokenText);
-          };
-        });
-
+        recognitionRef.current = recognition;
         recognition.start();
+    }, [isEnrolling, processCommand]);
 
-        // Record audio at the same time
-        const audioBlob = await recordAudio(5000); // 5 seconds for better capture
-
-        // Wait for STT to finish (with timeout)
-        await Promise.race([
-          sttPromise,
-          new Promise(r => setTimeout(r, 6000))
-        ]);
-
-        try { recognition.stop(); } catch (e) { }
-        setCurrentTranscript(""); // Clear the live transcript
-
-        addMessage("assistant", `🔄 Verifying...\n\n🗣️ You said: "${spokenText || '(no speech detected)'}"`, false, true);
-        setStatus("processing");
-
-        // Step 4: Verify using browser STT
-        const result = await verifyChallengeWithText(challenge.sessionId, audioBlob, spokenText);
-
-        if (result.success && result.speakerMatch && result.phraseMatch) {
-          setIsVerified(true);
-          setAuthScore(result.speakerScore);
-          authSessionRef.current?.setAuthenticated(result.speakerScore);
-
-          addMessage("assistant", `✅ Voice Verified Successfully!\n\nConfidence: ${Math.round(result.speakerScore * 100)}%\n\nYou can now use navigation commands like:\n• "Open dashboard"\n• "Show vibrations"\n• "Go to settings"`, false, true, true);
-          speak("Voice verified! You can now navigate the app with voice commands.");
-
-        } else {
-          const reason = !result.speakerMatch ? `Voice mismatch (score: ${Math.round(result.speakerScore * 100)}%)` :
-            !result.phraseMatch ? `Phrase mismatch (heard: "${result.spokenText}")` :
-              result.message;
-
-          addMessage("assistant", `❌ Verification Failed\n\nReason: ${reason}\nTrials left: ${result.trialsRemaining}\n\nTry again by saying "Verify my voice"`, true);
-          speak("Verification failed. " + reason);
-        }
-      } else {
-        // Fallback: no browser STT, use backend Whisper
-        const audioBlob = await recordAudio(4000);
-        addMessage("assistant", "🔄 Verifying your voice...", false, true);
-        setStatus("processing");
-
-        const result = await verifyChallenge(challenge.sessionId, audioBlob);
-
-        if (result.success && result.speakerMatch && result.phraseMatch) {
-          setIsVerified(true);
-          setAuthScore(result.speakerScore);
-          authSessionRef.current?.setAuthenticated(result.speakerScore);
-          addMessage("assistant", `✅ Voice Verified!`, false, true, true);
-          speak("Voice verified!");
-        } else {
-          addMessage("assistant", `❌ Verification Failed: ${result.message}`, true);
-          speak("Verification failed.");
-        }
-      }
-
-    } catch (error) {
-      addMessage("assistant", `❌ Error: ${error.message}`, true);
-    }
-
-    setChallengePhrase("");
-    setStatus("idle");
-  }, [isEnrolled, voiceAuthStatus, userId, speak]);
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 🧭 NAVIGATION COMMANDS (Requires Verification)
-  // ═══════════════════════════════════════════════════════════════════════════
-  const NAVIGATION_COMMANDS = [
-    { pattern: /(home|dashboard|main)/, route: "/", response: "Opening dashboard" },
-    { pattern: /(vibration|signal|wave)/, route: "/vibrations", response: "Showing live vibrations" },
-    { pattern: /(notification|alert|intruder)/, route: "/notifications", response: "Opening notifications" },
-    { pattern: /(profile|account)/, route: "/profile", response: "Opening your profile" },
-    { pattern: /(setting|settings|preference)/, route: "/settings", response: "Opening settings" },
-    { pattern: /(faq|help page|question)/, route: "/faqs", response: "Opening FAQs" },
-    { pattern: /(about|information)/, route: "/about", response: "Opening about page" },
-  ];
-
-  const handleNavigation = useCallback((text) => {
-    for (const cmd of NAVIGATION_COMMANDS) {
-      if (cmd.pattern.test(text)) {
-        navigate(cmd.route);
-        addMessage("assistant", `🧭 ${cmd.response}`, false, false, true);
-        speak(cmd.response);
-        return true;
-      }
-    }
-    return false;
-  }, [navigate, speak]);
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 💬 MESSAGE HELPER
-  // ═══════════════════════════════════════════════════════════════════════════
-  const addMessage = (type, text, isError = false, isSystem = false, isSuccess = false) => {
-    setConversationHistory(prev => [...prev, { type, text, isError, isSystem, isSuccess }]);
-  };
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 🔍 FIND ANSWER FROM KNOWLEDGE BASE
-  // ═══════════════════════════════════════════════════════════════════════════
-  const findAnswer = (query) => {
-    const text = query.toLowerCase().trim();
-    let bestMatch = null;
-    let maxScore = 0;
-
-    for (const entry of KNOWLEDGE_BASE) {
-      let score = 0;
-      for (const keyword of entry.keywords) {
-        if (text.includes(keyword)) {
-          score += keyword.split(" ").length;
-        }
-      }
-      if (score > maxScore) {
-        maxScore = score;
-        bestMatch = entry;
-      }
-    }
-
-    return maxScore > 0 ? bestMatch : null;
-  };
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 🎯 PROCESS INPUT
-  // ═══════════════════════════════════════════════════════════════════════════
-  const processInput = useCallback((input) => {
-    const text = input.toLowerCase().trim();
-    setStatus("processing");
-
-    // Add user message
-    addMessage("user", input);
-
-    // COMMAND: Enroll
-    if (text.includes("enroll")) {
-      startEnrollment();
-      return;
-    }
-
-    // COMMAND: Verify
-    if (text.includes("verify") || text.includes("authenticate")) {
-      performVoiceAuth();
-      return;
-    }
-
-    // COMMAND: Auth Status
-    if (text.includes("status") || text.includes("am i verified")) {
-      if (isVerified && authSessionRef.current?.isValid()) {
-        const mins = Math.round(authSessionRef.current.getRemainingTime() / 60000);
-        addMessage("assistant", `✅ Verified (${Math.round(authScore * 100)}%)\nSession: ${mins} minutes remaining`);
-      } else if (isEnrolled) {
-        addMessage("assistant", "🔒 Enrolled but not verified.\nSay 'Verify my voice' to authenticate.");
-      } else {
-        addMessage("assistant", "❌ Not enrolled.\nSay 'Enroll my voice' to start.");
-      }
-      setStatus("idle");
-      return;
-    }
-
-    // COMMAND: Logout/Reset
-    if (text.includes("logout") || text.includes("reset voice")) {
-      setIsVerified(false);
-      authSessionRef.current?.clear();
-      addMessage("assistant", "🔓 Voice session cleared. Say 'Verify my voice' to re-authenticate.");
-      speak("Voice session cleared.");
-      setStatus("idle");
-      return;
-    }
-
-    // NAVIGATION COMMANDS - Requires verification
-    const isNavCommand = NAVIGATION_COMMANDS.some(cmd => cmd.pattern.test(text));
-    if (isNavCommand) {
-      if (!isVerified || !authSessionRef.current?.isValid()) {
-        addMessage("assistant", "🔒 Voice verification required!\n\nNavigigation commands need authentication. Say 'Verify my voice' first.", true);
-        speak("Please verify your voice first to use navigation commands.");
-        setStatus("idle");
-        return;
-      }
-
-      if (handleNavigation(text)) {
-        setStatus("idle");
-        return;
-      }
-    }
-
-    // Q&A - Available without verification
-    const answer = findAnswer(text);
-    if (answer) {
-      addMessage("assistant", answer.answer);
-      speak(answer.shortAnswer);
-      setStatus("idle");
-      return;
-    }
-
-    // Fallback
-    const fallback = isEnrolled
-      ? "I didn't understand. Try 'verify my voice' or ask about SynapSense."
-      : "I didn't understand. Say 'enroll my voice' to start, or ask about SynapSense.";
-    addMessage("assistant", fallback);
-    speak(fallback);
-    setStatus("idle");
-  }, [startEnrollment, performVoiceAuth, handleNavigation, isVerified, isEnrolled, authScore, speak]);
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 🎙️ SPEECH RECOGNITION
-  // ═══════════════════════════════════════════════════════════════════════════
-  const startListening = useCallback(() => {
-    if (!SpeechRecognition) {
-      addMessage("assistant", "Speech recognition not supported. Use Chrome or Edge.", true);
-      return;
-    }
-
-    if (isEnrolling) {
-      addMessage("assistant", "⚠️ Please complete enrollment first!", true);
-      return;
-    }
-
-    stopSpeaking();
-    lastTranscriptRef.current = "";
-    hasProcessedRef.current = false;
-
-    if (listeningTimeoutRef.current) clearTimeout(listeningTimeoutRef.current);
-    if (recognitionRef.current) {
-      try { recognitionRef.current.abort(); } catch (e) { }
-    }
-
-    try {
-      const recognition = new SpeechRecognition();
-      recognition.lang = "en-US";
-      recognition.continuous = true;
-      recognition.interimResults = true;
-
-      recognition.onstart = () => {
-        setIsListening(true);
-        setStatus("listening");
-        setCurrentTranscript("");
-
-        listeningTimeoutRef.current = setTimeout(() => {
-          if (recognitionRef.current && !hasProcessedRef.current) {
-            if (lastTranscriptRef.current.trim()) {
-              hasProcessedRef.current = true;
-              processInput(lastTranscriptRef.current);
-            }
-            try { recognitionRef.current.stop(); } catch (e) { }
-          }
-        }, 8000);
-      };
-
-      recognition.onspeechend = () => {
-        setTimeout(() => {
-          if (recognitionRef.current && !hasProcessedRef.current) {
-            try { recognitionRef.current.stop(); } catch (e) { }
-          }
-        }, 500);
-      };
-
-      recognition.onresult = (event) => {
-        const lastResult = event.results[event.results.length - 1];
-        const text = lastResult[0].transcript;
-
-        lastTranscriptRef.current = text;
-        setCurrentTranscript(text);
-
-        if (lastResult.isFinal && !hasProcessedRef.current) {
-          hasProcessedRef.current = true;
-          setCurrentTranscript("");
-          if (listeningTimeoutRef.current) clearTimeout(listeningTimeoutRef.current);
-          try { recognition.stop(); } catch (e) { }
-          processInput(text);
-        }
-      };
-
-      recognition.onerror = (event) => {
-        if (listeningTimeoutRef.current) clearTimeout(listeningTimeoutRef.current);
-        if (event.error === "aborted") {
-          if (lastTranscriptRef.current.trim() && !hasProcessedRef.current) {
-            hasProcessedRef.current = true;
-            processInput(lastTranscriptRef.current);
-          }
-        } else if (event.error !== "no-speech") {
-          addMessage("assistant", `Mic error: ${event.error}`, true);
-        }
-        setIsListening(false);
-        setStatus("idle");
-      };
-
-      recognition.onend = () => {
-        if (listeningTimeoutRef.current) clearTimeout(listeningTimeoutRef.current);
-        if (lastTranscriptRef.current.trim() && !hasProcessedRef.current) {
-          hasProcessedRef.current = true;
-          processInput(lastTranscriptRef.current);
-        }
-        setIsListening(false);
-        setCurrentTranscript("");
-        setStatus(prev => prev === "listening" ? "idle" : prev);
-      };
-
-      recognitionRef.current = recognition;
-      recognition.start();
-    } catch (error) {
-      addMessage("assistant", `Error: ${error.message}`, true);
-      setStatus("error");
-      setIsListening(false);
-    }
-  }, [processInput, stopSpeaking, isEnrolling]);
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 📝 HANDLE TEXT SUBMIT
-  // ═══════════════════════════════════════════════════════════════════════════
-  const handleTextSubmit = (e) => {
-    e.preventDefault();
-    if (!textInput.trim()) return;
-    processInput(textInput);
-    setTextInput("");
-  };
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 📋 TOGGLE PANEL
-  // ═══════════════════════════════════════════════════════════════════════════
-  const togglePanel = () => {
-    stopSpeaking();
-    setIsPanelOpen(!isPanelOpen);
-    if (!isPanelOpen && conversationHistory.length === 0) {
-      const welcome = isEnrolled
-        ? isVerified
-          ? "Welcome back! ✅ Voice verified. You can navigate with voice commands."
-          : "Welcome! 🔐 Say 'Verify my voice' to authenticate and unlock navigation."
-        : "Hello! 🎤 Say 'Enroll my voice' to register your voiceprint first.";
-      addMessage("assistant", welcome);
-    }
-  };
-
-  // Scroll to bottom
-  useEffect(() => {
-    if (answerPanelRef.current) {
-      answerPanelRef.current.scrollTop = answerPanelRef.current.scrollHeight;
-    }
-  }, [conversationHistory]);
-
-  // Cleanup
-  useEffect(() => {
-    return () => {
-      if (recognitionRef.current) recognitionRef.current.abort();
-      if (voiceStreamRef.current) voiceStreamRef.current.disconnect();
-      speechSynthesis.cancel();
+    const handleAddOwner = () => {
+        if (!newOwnerName.trim()) return;
+        if (!hasOwnerPassword()) openPinModal("setup", () => { addOwner(newOwnerName.trim()); setOwnersState(getOwners()); setNewOwnerName(""); setShowOwnerModal(false); });
+        else openPinModal("verify", () => { addOwner(newOwnerName.trim()); setOwnersState(getOwners()); setNewOwnerName(""); setShowOwnerModal(false); });
     };
-  }, []);
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 🎨 STATUS HELPERS
-  // ═══════════════════════════════════════════════════════════════════════════
-  const getStatusStyle = () => {
-    if (isVerified) return "bg-green-600 shadow-green-500/50";
-    if (isEnrolled) return "bg-yellow-600 shadow-yellow-500/50";
-    switch (status) {
-      case "listening": return "bg-green-500 animate-pulse shadow-green-500/50";
-      case "processing": return "bg-yellow-500 shadow-yellow-500/50";
-      case "speaking": return "bg-blue-500 shadow-blue-500/50";
-      case "authenticating": return "bg-purple-500 animate-pulse shadow-purple-500/50";
-      default: return "bg-indigo-600 hover:bg-indigo-700 shadow-indigo-600/50";
-    }
-  };
+    // ═══════════════════════════════════════════════════════════════════════════
+    // UI STYLING
+    // ═══════════════════════════════════════════════════════════════════════════
+    const getOrbClass = () => {
+        if (status === "denied" || status === "error") return "border-red-500/50 shadow-red-500/20";
+        if (status === "verified" || status === "success") return "border-cyan-400/50 shadow-cyan-400/20";
+        if (status === "listening" || status === "recording") return "border-blue-400/50 shadow-blue-400/20";
+        if (status === "processing" || status === "verifying" || status === "enrolling") return "border-yellow-400/50 shadow-yellow-400/20";
+        if (isVerified) return "border-cyan-500/30 shadow-cyan-500/10";
+        return "border-slate-600/50 shadow-slate-600/10";
+    };
 
-  const getStatusText = () => {
-    if (isEnrolling) return `Enrolling... (${enrollmentStep}/3)`;
-    switch (status) {
-      case "listening": return "🎧 Listening...";
-      case "processing": return "⚙️ Processing...";
-      case "speaking": return "🔊 Speaking...";
-      case "authenticating": return "🔐 Authenticating...";
-      default: return isVerified ? "✅ Verified" : isEnrolled ? "🔒 Enrolled" : "❌ Not Enrolled";
-    }
-  };
+    const isActive = ["listening", "recording", "processing", "verifying", "enrolling"].includes(status) || isEnrolling;
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // 🎨 RENDER
-  // ═══════════════════════════════════════════════════════════════════════════
-  return (
-    <>
-      {/* Floating Button */}
-      <button
-        onClick={togglePanel}
-        className={`fixed bottom-6 right-6 z-[9999] w-14 h-14 rounded-full 
-                   flex items-center justify-center text-white text-2xl
-                   shadow-lg transition-all duration-300 transform
-                   ${isPanelOpen ? "rotate-45 bg-red-500 hover:bg-red-600" : getStatusStyle()}
-                   hover:scale-110`}
-        title={isPanelOpen ? "Close" : "Voice Assistant"}
-      >
-        {isPanelOpen ? "✕" : isVerified ? "🔓" : isEnrolled ? "🔐" : "🎙️"}
-      </button>
+    return (
+        <>
+            {/* PIN Modal */}
+            {showPinModal && (
+                <div className="fixed inset-0 bg-black/95 flex items-center justify-center z-[9999] font-mono">
+                    <div className="bg-slate-950 p-8 rounded border border-slate-800 w-80">
+                        <div className="text-center mb-6">
+                            <div className="text-slate-500 text-xs tracking-[0.3em] mb-2">SECURITY</div>
+                            <div className="text-white text-lg tracking-widest">{pinModalMode === "setup" ? "CREATE PIN" : "ENTER PIN"}</div>
+                        </div>
 
-      {/* Panel */}
-      {isPanelOpen && (
-        <div className="fixed bottom-24 right-6 z-[9998] w-96 h-[500px]
-                        bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900
-                        rounded-2xl shadow-2xl border border-slate-700/50
-                        flex flex-col backdrop-blur-xl"
-          style={{ animation: 'slideUp 0.3s ease-out' }}>
+                        <input type="password" maxLength={4} value={pinValue} onChange={(e) => setPinValue(e.target.value.replace(/\D/g, ""))}
+                            placeholder="• • • •" className="w-full bg-black text-cyan-400 text-center text-2xl tracking-[1em] p-4 rounded border border-slate-700 focus:border-cyan-500/50 outline-none font-mono mb-4" autoFocus />
 
-          {/* Header */}
-          <div className={`px-5 py-4 flex items-center justify-between flex-shrink-0 ${isVerified ? "bg-gradient-to-r from-green-600 to-emerald-600" :
-            isEnrolled ? "bg-gradient-to-r from-yellow-600 to-orange-600" :
-              "bg-gradient-to-r from-indigo-600 via-purple-600 to-indigo-700"
-            } rounded-t-2xl`}>
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center backdrop-blur">
-                <span className="text-xl">{isVerified ? "🔓" : isEnrolled ? "🔐" : "🎤"}</span>
-              </div>
-              <div>
-                <h3 className="text-white font-semibold text-lg">Voice Assistant</h3>
-                <p className="text-white/80 text-xs">{getStatusText()}</p>
-              </div>
-            </div>
-            <button onClick={() => { stopSpeaking(); setIsPanelOpen(false); }} className="text-white/70 hover:text-white p-1">
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-              </svg>
-            </button>
-          </div>
+                        {pinModalMode === "setup" && (
+                            <input type="password" maxLength={4} value={pinConfirmValue} onChange={(e) => setPinConfirmValue(e.target.value.replace(/\D/g, ""))}
+                                placeholder="CONFIRM" className="w-full bg-black text-cyan-400 text-center text-2xl tracking-[1em] p-4 rounded border border-slate-700 focus:border-cyan-500/50 outline-none font-mono mb-4" />
+                        )}
 
-          {/* Enrollment Phrase Display */}
-          {currentEnrollPhrase && (
-            <div className="px-4 py-3 bg-gradient-to-r from-indigo-600/30 to-purple-600/30 border-b border-indigo-500/30 flex-shrink-0">
-              <p className="text-xs text-indigo-300 mb-1">🎤 Say this phrase ({enrollmentStep}/3):</p>
-              <p className="text-lg font-bold text-white text-center">"{currentEnrollPhrase}"</p>
-            </div>
-          )}
+                        {pinError && <p className="text-red-400 text-center text-xs tracking-wider mb-4">{pinError}</p>}
 
-          {/* Challenge Phrase Display */}
-          {challengePhrase && (
-            <div className="px-4 py-3 bg-gradient-to-r from-purple-600/30 to-pink-600/30 border-b border-purple-500/30 flex-shrink-0">
-              <p className="text-xs text-purple-300 mb-1">🔐 Challenge phrase:</p>
-              <p className="text-lg font-bold text-white text-center">"{challengePhrase}"</p>
-            </div>
-          )}
-
-          {/* LIVE SPEECH DISPLAY - Shows what user is saying in real-time */}
-          {currentTranscript && status === "listening" && (
-            <div className="px-4 py-3 bg-gradient-to-r from-green-600/40 to-emerald-600/40 border-b border-green-500/30 flex-shrink-0">
-              <div className="flex items-center gap-2 mb-1">
-                <span className="w-2 h-2 bg-green-500 rounded-full animate-ping"></span>
-                <p className="text-xs text-green-300">🎙️ You're saying:</p>
-              </div>
-              <p className="text-lg font-bold text-white text-center">{currentTranscript}</p>
-            </div>
-          )}
-
-          {/* Conversation - Scrollable Area */}
-          <div
-            ref={answerPanelRef}
-            className="flex-1 overflow-y-auto p-4 space-y-3 voice-chat-scroll"
-          >
-            {conversationHistory.map((msg, i) => (
-              <div key={i} className={`flex ${msg.type === "user" ? "justify-end" : "justify-start"}`}>
-                <div className={`max-w-[85%] rounded-2xl px-4 py-3 ${msg.type === "user" ? "bg-indigo-600 text-white rounded-br-sm" :
-                  msg.isError ? "bg-red-600/30 text-red-200 border border-red-500/30 rounded-bl-sm" :
-                    msg.isSuccess ? "bg-green-600/30 text-green-200 border border-green-500/30 rounded-bl-sm" :
-                      msg.isSystem ? "bg-slate-600/50 text-slate-300 rounded-bl-sm italic" :
-                        "bg-slate-700/80 text-slate-200 rounded-bl-sm"
-                  }`}>
-                  <p className="text-sm leading-relaxed whitespace-pre-line">{msg.text}</p>
+                        <div className="flex gap-3">
+                            <button onClick={() => setShowPinModal(false)} className="flex-1 py-3 bg-slate-900 text-slate-500 rounded border border-slate-800 hover:border-slate-600 transition-all text-xs tracking-widest">CANCEL</button>
+                            <button onClick={handlePinSubmit} className="flex-1 py-3 bg-slate-900 text-cyan-400 rounded border border-cyan-500/30 hover:border-cyan-400/50 transition-all text-xs tracking-widest">CONFIRM</button>
+                        </div>
+                    </div>
                 </div>
-              </div>
-            ))}
-          </div>
+            )}
 
-          {/* Suggested Actions */}
-          {conversationHistory.length <= 1 && (
-            <div className="px-4 pb-3">
-              <div className="flex flex-wrap gap-2">
-                {SUGGESTED_ACTIONS.map((a, i) => (
-                  <button
-                    key={i}
-                    onClick={() => processInput(a.text)}
-                    disabled={isEnrolling}
-                    className={`text-xs px-3 py-1.5 rounded-full flex items-center gap-1
-                               ${a.category === "auth" ? "bg-purple-700/50 text-purple-300 border-purple-500/50" :
-                        "bg-slate-700/50 text-indigo-300 border-slate-600/50"}
-                               border hover:opacity-80 transition-all disabled:opacity-50`}
-                  >
-                    <span>{a.icon}</span> {a.text}
-                  </button>
-                ))}
-              </div>
+            {/* Owner Modal */}
+            {showOwnerModal && (
+                <div className="fixed inset-0 bg-black/95 flex items-center justify-center z-[9999] font-mono">
+                    <div className="bg-slate-950 p-6 rounded border border-slate-800 w-96 max-h-[80vh] overflow-auto">
+                        <div className="flex items-center justify-between mb-6">
+                            <div className="text-white text-sm tracking-widest">VOICE PROFILES</div>
+                            <button onClick={() => setShowOwnerModal(false)} className="text-slate-600 hover:text-white text-xl">×</button>
+                        </div>
+
+                        <div className="flex gap-2 mb-6">
+                            <input type="text" value={newOwnerName} onChange={(e) => setNewOwnerName(e.target.value)} placeholder="Profile name"
+                                className="flex-1 bg-black text-white px-4 py-3 rounded border border-slate-700 focus:border-cyan-500/50 outline-none text-xs tracking-wide" />
+                            <button onClick={handleAddOwner} className="px-6 py-3 bg-slate-900 text-cyan-400 rounded border border-cyan-500/30 text-xs tracking-widest hover:border-cyan-400/50">ADD</button>
+                        </div>
+
+                        <div className="space-y-2">
+                            {owners.map((o) => (
+                                <div key={o} className="flex items-center justify-between bg-slate-900/50 p-4 rounded border border-slate-800">
+                                    <div className="flex items-center gap-3">
+                                        <div className={`w-2 h-2 rounded-full ${enrolledOwners.includes(o) ? "bg-cyan-400" : "bg-slate-600"}`} />
+                                        <span className="text-white text-xs tracking-wider">{o === "owner" ? "PRIMARY" : o.toUpperCase()}</span>
+                                        {enrolledOwners.includes(o) && <span className="text-cyan-400/60 text-[10px] tracking-widest">ACTIVE</span>}
+                                    </div>
+                                    <div className="flex gap-2">
+                                        {!enrolledOwners.includes(o) && (
+                                            <button onClick={() => { setShowOwnerModal(false); startEnrollment(o); }} className="px-3 py-1 bg-slate-800 text-slate-400 rounded text-[10px] tracking-wider hover:text-white">ENROLL</button>
+                                        )}
+                                        {o !== "owner" && (
+                                            <button onClick={() => { removeOwner(o); setOwnersState(getOwners()); setEnrolledOwnersState(getEnrolledOwners()); }} className="px-2 py-1 bg-slate-800 text-red-400/60 rounded text-[10px] hover:text-red-400">×</button>
+                                        )}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Floating Button */}
+            <div className="fixed bottom-8 right-8 z-50">
+                <button onClick={() => setIsPanelOpen(!isPanelOpen)}
+                    className={`relative w-16 h-16 rounded-full bg-slate-950 border-2 ${getOrbClass()} shadow-lg flex items-center justify-center transition-all hover:scale-105 ${isActive ? "animate-pulse" : ""}`}>
+                    <div className={`w-6 h-6 rounded-full ${isVerified ? "bg-cyan-400" : status === "denied" ? "bg-red-500" : "bg-slate-600"}`} />
+                    <div className={`absolute -top-1 -right-1 w-4 h-4 rounded-full flex items-center justify-center text-[8px] font-bold ${voiceAuthStatus === "ready" ? "bg-cyan-500" : "bg-red-500"} text-black`}>
+                        {voiceAuthStatus === "ready" ? "●" : "!"}
+                    </div>
+                </button>
             </div>
-          )}
 
-          {/* Input */}
-          <div className="p-4 bg-slate-800/50 border-t border-slate-700/50">
-            <form onSubmit={handleTextSubmit} className="flex gap-2">
-              <input
-                type="text"
-                value={textInput}
-                onChange={(e) => setTextInput(e.target.value)}
-                placeholder={isEnrolling ? "Enrollment in progress..." : "Type or speak..."}
-                disabled={isEnrolling}
-                className="flex-1 bg-slate-700/50 border border-slate-600/50 rounded-xl 
-                           px-4 py-3 text-white placeholder-slate-400 text-sm
-                           focus:outline-none focus:border-indigo-500/50 disabled:opacity-50"
-              />
-              <button
-                type="button"
-                onClick={startListening}
-                disabled={isListening || isEnrolling}
-                className={`w-12 h-12 rounded-xl flex items-center justify-center text-lg
-                           ${isListening ? "bg-green-500 animate-pulse" : "bg-indigo-600 hover:bg-indigo-500"}
-                           text-white disabled:opacity-50`}
-              >
-                {isListening ? "🎧" : "🎙️"}
-              </button>
-              <button
-                type="submit"
-                disabled={!textInput.trim() || isEnrolling}
-                className="w-12 h-12 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 
-                           text-white flex items-center justify-center disabled:opacity-50"
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
-                </svg>
-              </button>
-            </form>
-          </div>
+            {/* Panel */}
+            {isPanelOpen && (
+                <div className="fixed bottom-28 right-8 w-80 bg-slate-950 border border-slate-800 rounded z-50 overflow-hidden font-mono shadow-2xl shadow-black/50">
+                    {/* Header */}
+                    <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between">
+                        <div>
+                            <div className="text-white text-sm tracking-[0.2em]">SYNAPSENSE</div>
+                            <div className="text-slate-600 text-[10px] tracking-[0.3em]">VOICE CONTROL v2.0</div>
+                        </div>
+                        <div className="flex gap-2">
+                            <button onClick={() => setShowOwnerModal(true)} className="w-8 h-8 rounded bg-slate-900 flex items-center justify-center text-slate-500 hover:text-white border border-slate-800">
+                                <span className="text-xs">◉</span>
+                            </button>
+                            <button onClick={() => setIsPanelOpen(false)} className="w-8 h-8 rounded bg-slate-900 flex items-center justify-center text-slate-500 hover:text-white border border-slate-800">×</button>
+                        </div>
+                    </div>
 
-          {/* Footer */}
-          <div className="px-4 py-2 bg-slate-900/50 border-t border-slate-700/30">
-            <p className="text-center text-slate-500 text-xs">
-              {voiceAuthStatus === "ready" ? "🟢" : "🔴"} Voice Auth •
-              {isVerified ? " ✅ Verified" : isEnrolled ? " 🔐 Enrolled" : " ❌ Not Enrolled"}
-            </p>
-          </div>
-        </div>
-      )}
+                    {/* Display */}
+                    <div className="p-6">
+                        {/* Status Ring */}
+                        <div className="relative mx-auto w-28 h-28 mb-6">
+                            <div className={`absolute inset-0 rounded-full border-2 ${getOrbClass()} ${isActive ? "animate-spin" : ""}`} style={{ animationDuration: "3s" }} />
+                            <div className={`absolute inset-2 rounded-full border ${getOrbClass()}`} />
+                            <div className="absolute inset-0 flex items-center justify-center">
+                                <div className={`w-10 h-10 rounded-full ${isVerified ? "bg-cyan-400/20" : status === "denied" ? "bg-red-500/20" : "bg-slate-700/50"} flex items-center justify-center`}>
+                                    <div className={`w-4 h-4 rounded-full ${isVerified ? "bg-cyan-400" : status === "denied" ? "bg-red-500" : "bg-slate-500"}`} />
+                                </div>
+                            </div>
+                        </div>
 
-      <style>{`
-        @keyframes slideUp {
-          from { opacity: 0; transform: translateY(20px); }
-          to { opacity: 1; transform: translateY(0); }
-        }
-        .animate-slideUp { animation: slideUp 0.3s ease-out forwards; }
-      `}</style>
-    </>
-  );
+                        {/* Status Text */}
+                        <div className="text-center mb-4">
+                            <div className="text-white text-lg tracking-[0.15em] mb-1">
+                                {status === "idle" && (isVerified ? "READY" : isEnrolled ? "LOCKED" : "SETUP")}
+                                {status === "listening" && "LISTENING"}
+                                {status === "recording" && "RECORDING"}
+                                {status === "processing" && "PROCESSING"}
+                                {status === "verifying" && "VERIFYING"}
+                                {status === "verified" && "AUTHENTICATED"}
+                                {status === "success" && "SUCCESS"}
+                                {status === "error" && "ERROR"}
+                                {status === "denied" && "DENIED"}
+                                {status === "locked" && "LOCKED"}
+                                {status === "challenge" && "CHALLENGE"}
+                                {status === "info" && "HELP"}
+                                {status === "enrolling" && `ENROLLING ${enrollmentStep}/3`}
+                            </div>
+                            <div className="text-slate-500 text-xs tracking-wide whitespace-pre-line">{statusMessage}</div>
+                            {currentUser && isVerified && (
+                                <div className="text-cyan-400/60 text-[10px] tracking-[0.2em] mt-2">USER: {currentUser.toUpperCase()}</div>
+                            )}
+                        </div>
+
+                        {/* Live Transcript */}
+                        {liveTranscript && (
+                            <div className="mb-4 p-3 bg-slate-900/50 rounded border border-slate-800">
+                                <div className="text-cyan-400/80 text-xs tracking-wide">› {liveTranscript}</div>
+                            </div>
+                        )}
+
+                        {/* Enrollment Phrase */}
+                        {isEnrolling && currentEnrollPhrase && (
+                            <div className="mb-4 p-3 bg-slate-900/50 rounded border border-slate-800">
+                                <div className="text-white text-sm text-center tracking-wide">"{currentEnrollPhrase}"</div>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Actions */}
+                    <div className="px-5 pb-5 space-y-2">
+                        {!isEnrolled ? (
+                            <button onClick={() => startEnrollment("owner")} className="w-full py-4 bg-slate-900 text-cyan-400 rounded border border-cyan-500/30 text-xs tracking-[0.15em] hover:border-cyan-400/50 transition-all">
+                                🎤 CREATE VOICEPRINT
+                            </button>
+                        ) : !isVerified ? (
+                            <button onClick={performVerification} className="w-full py-4 bg-slate-900 text-cyan-400 rounded border border-cyan-500/30 text-xs tracking-[0.15em] hover:border-cyan-400/50 transition-all">
+                                🔓 AUTHENTICATE
+                            </button>
+                        ) : (
+                            <button onClick={startListening} className="w-full py-4 bg-slate-900 text-cyan-400 rounded border border-cyan-500/30 text-xs tracking-[0.15em] hover:border-cyan-400/50 transition-all">
+                                🎙️ VOICE COMMAND
+                            </button>
+                        )}
+
+                        {/* Quick Commands (when authenticated) */}
+                        {isVerified && (
+                            <div className="grid grid-cols-3 gap-2 pt-2">
+                                <button onClick={() => { navigate("/"); updateStatus("success", "→ HOME"); }} className="py-2 bg-slate-900/50 text-slate-400 rounded border border-slate-800 text-[10px] tracking-wider hover:text-white hover:border-slate-600">HOME</button>
+                                <button onClick={() => { navigate("/vibrations"); updateStatus("success", "→ VIBRATIONS"); }} className="py-2 bg-slate-900/50 text-slate-400 rounded border border-slate-800 text-[10px] tracking-wider hover:text-white hover:border-slate-600">SENSOR</button>
+                                <button onClick={() => { navigate("/settings"); updateStatus("success", "→ SETTINGS"); }} className="py-2 bg-slate-900/50 text-slate-400 rounded border border-slate-800 text-[10px] tracking-wider hover:text-white hover:border-slate-600">SETTINGS</button>
+                            </div>
+                        )}
+
+                        {enrolledOwners.length > 0 && (
+                            <div className="flex items-center justify-center gap-2 pt-2">
+                                <div className="w-1.5 h-1.5 rounded-full bg-cyan-400/50" />
+                                <div className="text-slate-600 text-[10px] tracking-[0.2em]">{enrolledOwners.length} VOICE PROFILE{enrolledOwners.length > 1 ? "S" : ""}</div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
+        </>
+    );
 }
