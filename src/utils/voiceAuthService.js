@@ -281,7 +281,8 @@ export const checkAPIHealth = async () => {
             ready: data.status === 'ready_for_demo',
             status: data.status,
             modelLoaded: data.model_loaded,
-            version: data.version
+            version: data.version,
+            sttAvailable: data.stt_available !== false
         };
     } catch (error) {
         console.error('Voice Auth API health check failed:', error);
@@ -290,6 +291,57 @@ export const checkAPIHealth = async () => {
             status: 'error',
             modelLoaded: false,
             error: error.message
+        };
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 🎤 BACKEND STT (Whisper)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Transcribe audio using backend Whisper STT
+ * @param {Blob} audioBlob - Audio to transcribe
+ * @returns {Promise<{success: boolean, text: string, message?: string}>}
+ */
+export const transcribeAudio = async (audioBlob) => {
+    try {
+        console.log('🎤 Backend STT: Sending', audioBlob.size, 'bytes');
+
+        const formData = new FormData();
+        formData.append('audio', prepareAudioBlob(audioBlob), 'recording.wav');
+
+        const response = await fetch(`${API_BASE}/api/v1/stt/transcribe`, {
+            method: 'POST',
+            body: formData
+        });
+
+        const data = await response.json();
+        console.log('🎤 Backend STT raw response:', data);
+
+        if (!response.ok) {
+            return {
+                success: false,
+                text: '',
+                message: data.detail || data.message || `HTTP ${response.status}`
+            };
+        }
+
+        // Parse backend response - it returns {success, text, message}
+        const text = (data.text || '').trim();
+        const success = data.success === true && text.length > 0;
+
+        return {
+            success: success,
+            text: text,
+            message: data.message || (success ? 'OK' : 'No speech detected')
+        };
+    } catch (error) {
+        console.error('🎤 Backend STT error:', error);
+        return {
+            success: false,
+            text: '',
+            message: error.message || 'Network error'
         };
     }
 };
@@ -687,6 +739,7 @@ export const createVoiceStream = (userId, onResult, onStatus, onError) => {
                                     authorized: data.authorized,
                                     score: data.score,
                                     decision: data.decision,
+                                    text: data.text,
                                     latencyMs: data.latency_ms
                                 });
                             }
@@ -731,13 +784,25 @@ export const createVoiceStream = (userId, onResult, onStatus, onError) => {
                 }
             });
 
-            // Create audio context for processing (with fallback sample rate)
-            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            // Create audio context for processing (force 16kHz)
+            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            audioContext = new AudioContextClass({ sampleRate: 16000 });
+            console.log("🎤 AudioContext Sample Rate:", audioContext.sampleRate); // DEBUG
 
+            // Create nodes
             const source = audioContext.createMediaStreamSource(mediaStream);
-            // Smaller buffer (2048) = 128ms latency at 16kHz, good balance of performance
+            const gainNode = audioContext.createGain();
             processor = audioContext.createScriptProcessor(2048, 1, 1);
 
+            // Configure Gain
+            gainNode.gain.value = 2.5; // Boost volume by 2.5x
+
+            // Connect: Source -> Gain -> Processor -> Destination
+            source.connect(gainNode);
+            gainNode.connect(processor);
+            processor.connect(audioContext.destination);
+
+            // Setup processing
             processor.onaudioprocess = (e) => {
                 if (ws && ws.readyState === WebSocket.OPEN && isStreaming) {
                     const samples = e.inputBuffer.getChannelData(0);
@@ -745,9 +810,6 @@ export const createVoiceStream = (userId, onResult, onStatus, onError) => {
                     ws.send(new Float32Array(samples).buffer);
                 }
             };
-
-            source.connect(processor);
-            processor.connect(audioContext.destination);
 
             isStreaming = true;
             if (onStatus) onStatus('streaming');
@@ -788,7 +850,18 @@ export const createVoiceStream = (userId, onResult, onStatus, onError) => {
         }
     };
 
+    const start = async () => {
+        await connect();
+        await startStreaming();
+    };
+
+    const stop = () => {
+        disconnect();
+    };
+
     return {
+        start,
+        stop,
         connect,
         startStreaming,
         stopStreaming,

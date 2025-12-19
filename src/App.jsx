@@ -3,7 +3,7 @@ import { useState, useEffect } from "react";
 
 import Navbar from "./components/Navbar";
 import Sidebar from "./components/Sidebar";
-import VoiceAssistant from "./components/VoiceAssistant"; // ✅ ENABLED
+import VoiceAssistant from "./components/VoiceAssistant";
 
 import Home from "./pages/Home";
 import Vibrations from "./pages/Vibrations";
